@@ -34,6 +34,60 @@ HEALTHY_DAILY_MSGS = 80
 USER_MARKER = "<!-- 下面是你的反思区，Claude 不会覆盖 -->"
 REGEN_MARKER = "<!-- 以上由 Claude 自动生成，重新跑会被覆盖 -->"
 
+# Bash 命令分类模式
+BASH_READ_CMDS = re.compile(r'^(cat\s|head\s|tail\s|less\s|more\s|wc\s)', re.I)
+BASH_WRITE_CMDS = re.compile(r'^(echo\s|printf\s|.*[<>].*)', re.I)
+BASH_EXPLORE_CMDS = re.compile(r'^(cd\s|pwd\s|which\s|whereis\s|uname\s|date\s|env\s)', re.I)
+BASH_DANGEROUS = re.compile(r'\brm\s+-rf\b|\brm\s+.*\*\b|\bgit\s+(reset|clean)\b', re.I)
+
+# 摩擦类型 → 改进建议映射
+FRICTION_ADVICE = {
+    "misunderstood_request": {
+        "观察": "Claude 频繁误解你的意图",
+        "约束": "开会话前用 1 句话写明目标 + 关键约束，不要只扔关键词",
+    },
+    "wrong_approach": {
+        "观察": "Claude 选择了错误的方法或路径",
+        "约束": "要求 Claude 先给出方案假设，确认后再执行",
+    },
+    "excessive_changes": {
+        "观察": "Claude 改了太多不相关的文件/代码",
+        "约束": "明确指定要改的文件和函数，禁止动没点名的部分",
+    },
+    "buggy_code": {
+        "观察": "生成的代码有 bug 需要反复修",
+        "约束": "要求先写测试再写实现，或至少给出验证步骤",
+    },
+    "recurring_bug": {
+        "观察": "同一个 bug 反复出现",
+        "约束": "把常见 bug 写进 CLAUDE.md 的编码纪律，每次开工前扫一眼",
+    },
+    "slow_progress": {
+        "观察": "任务推进太慢，反复兜圈子",
+        "约束": "设定时间上限（如 30 分钟），到点没进展就换方案",
+    },
+    "user_rejected_action": {
+        "观察": "Claude 提议的操作被你否决",
+        "约束": "要求 Claude 做重要操作前必须征得同意",
+    },
+    "incomplete_solution": {
+        "观察": "解决方案不完整，遗漏了边界情况",
+        "约束": "要求 Claude 列出'还有什么没考虑到'再结束",
+    },
+    "unable_to_resolve": {
+        "观察": "Claude 无法解决某个问题",
+        "约束": "设定求助阈值，超过就转人工或换工具",
+    },
+    "api_errors": {
+        "观察": "API 调用频繁报错",
+        "约束": "检查 API 密钥和配额，先小批量测试再批量执行",
+    },
+    "tool_failure": {
+        "观察": "工具调用失败（如文件不存在、命令报错）",
+        "约束": "要求 Claude 先确认文件/环境存在再执行命令",
+    },
+}
+
 
 def parse_args():
     p = argparse.ArgumentParser(add_help=False)
@@ -60,28 +114,38 @@ def parse_target(s):
 
 
 def parse_jsonl(path: Path):
+    """解析会话 jsonl，返回详细的工具调用和消息数据"""
     tool_counts = Counter()
     first_user = None
     first_ts = None
     last_ts = None
     user_msgs = 0
     interruptions = 0
-    short_msg = False
+    # 消息级数据
+    bash_commands = []  # [(timestamp, command, could_be_read)]
+    read_files = []     # [(timestamp, file_path)]
+    message_turns = []  # [{'ts': datetime, 'type': 'user'|'assistant', 'has_tool': bool}]
+
     for line in path.open(encoding="utf-8", errors="ignore"):
         try:
             d = json.loads(line)
         except Exception:
             continue
+
         ts = d.get("timestamp")
+        dt = None
         if ts:
             try:
-                t = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
                 if first_ts is None:
-                    first_ts = t
-                last_ts = t
+                    first_ts = dt
+                last_ts = dt
             except Exception:
                 pass
-        if d.get("type") == "user":
+
+        msg_type = d.get("type")
+
+        if msg_type == "user":
             user_msgs += 1
             if first_user is None:
                 content = d.get("message", {}).get("content")
@@ -92,14 +156,47 @@ def parse_jsonl(path: Path):
                         if isinstance(blk, dict) and blk.get("type") == "text":
                             first_user = blk.get("text", "")
                             break
-        elif d.get("type") == "assistant":
+            # 检查是否包含 tool_result（即对 assistant 工具的回应）
+            has_tool_result = False
+            content = d.get("message", {}).get("content")
+            if isinstance(content, list):
+                for blk in content:
+                    if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                        has_tool_result = True
+                        break
+            message_turns.append({"ts": dt, "type": "user", "has_tool": has_tool_result})
+
+        elif msg_type == "assistant":
             blocks = d.get("message", {}).get("content", [])
+            has_tool_use = False
             if isinstance(blocks, list):
                 for block in blocks:
                     if isinstance(block, dict) and block.get("type") == "tool_use":
-                        tool_counts[block.get("name", "?")] += 1
+                        has_tool_use = True
+                        tool_name = block.get("name", "?")
+                        tool_counts[tool_name] += 1
+                        tool_input = block.get("input", {})
+
+                        if tool_name == "Bash" and isinstance(tool_input, dict):
+                            cmd = tool_input.get("command", "")
+                            if cmd:
+                                could_be_read = bool(BASH_READ_CMDS.search(cmd))
+                                bash_commands.append({
+                                    "ts": dt,
+                                    "cmd": cmd,
+                                    "could_be_read": could_be_read,
+                                    "is_explore": bool(BASH_EXPLORE_CMDS.search(cmd)),
+                                    "is_dangerous": bool(BASH_DANGEROUS.search(cmd)),
+                                })
+                        elif tool_name == "Read" and isinstance(tool_input, dict):
+                            fp = tool_input.get("file_path", "")
+                            if fp:
+                                read_files.append({"ts": dt, "path": fp})
+            message_turns.append({"ts": dt, "type": "assistant", "has_tool": has_tool_use})
+
         if '"interrupted":true' in line:
             interruptions += 1
+
     return {
         "tool_counts": tool_counts,
         "first_user": first_user,
@@ -107,6 +204,9 @@ def parse_jsonl(path: Path):
         "last_ts": last_ts,
         "user_msgs": user_msgs,
         "interruptions": interruptions,
+        "bash_commands": bash_commands,
+        "read_files": read_files,
+        "message_turns": message_turns,
     }
 
 
@@ -158,17 +258,60 @@ def is_noise(it):
     return False
 
 
-def daily_stats(items):
+def daily_stats(items, target_date=None):
+    """计算指定日期的统计（修复跨天会话时长问题）"""
     total = Counter()
     user_msgs = 0
     dur_min = 0
+    all_bash = []
+    all_reads = []
+    all_turns = []
+
     for it in items:
-        for k, v in it["parsed"]["tool_counts"].items():
+        p = it["parsed"]
+        for k, v in p["tool_counts"].items():
             total[k] += v
-        user_msgs += it["parsed"]["user_msgs"]
-        if it["parsed"]["first_ts"] and it["parsed"]["last_ts"]:
-            dur_min += (it["parsed"]["last_ts"] - it["parsed"]["first_ts"]).total_seconds() / 60
-    return total, int(dur_min), user_msgs
+        user_msgs += p["user_msgs"]
+
+        # 修复时长计算：只统计目标日期内的消息时间，并分段（间隔>30分钟视为中断）
+        if target_date:
+            day_msgs = sorted([t["ts"] for t in p["message_turns"] if t["ts"] and t["ts"].date() == target_date])
+            if len(day_msgs) >= 2:
+                # 分段计算，间隔超过30分钟不计入
+                GAP_SECONDS = 30 * 60
+                active_seconds = 0
+                segment_start = day_msgs[0]
+                for i in range(1, len(day_msgs)):
+                    gap = (day_msgs[i] - day_msgs[i-1]).total_seconds()
+                    if gap > GAP_SECONDS:
+                        active_seconds += (day_msgs[i-1] - segment_start).total_seconds()
+                        segment_start = day_msgs[i]
+                active_seconds += (day_msgs[-1] - segment_start).total_seconds()
+                dur_min += active_seconds / 60
+        else:
+            # 兼容旧逻辑
+            if p["first_ts"] and p["last_ts"]:
+                dur_min += (p["last_ts"] - p["first_ts"]).total_seconds() / 60
+
+        all_bash.extend(p["bash_commands"])
+        all_reads.extend(p["read_files"])
+        all_turns.extend(p["message_turns"])
+
+    # 计算当天最早和最晚消息时间
+    all_day_ts = sorted([t["ts"] for t in all_turns if t["ts"] and (target_date is None or t["ts"].date() == target_date)])
+    earliest_ts = all_day_ts[0] if all_day_ts else None
+    latest_ts = all_day_ts[-1] if all_day_ts else None
+
+    return {
+        "total": total,
+        "dur_min": int(dur_min),
+        "user_msgs": user_msgs,
+        "bash_commands": all_bash,
+        "read_files": all_reads,
+        "message_turns": all_turns,
+        "earliest_ts": earliest_ts,
+        "latest_ts": latest_ts,
+    }
 
 
 def short(s, n=70):
@@ -184,6 +327,124 @@ def bash_read_ratio(total):
     if read == 0:
         return None if bash <= 5 else float("inf")
     return bash / read
+
+
+def find_bash_clusters(bash_commands, gap_seconds=120):
+    """找出 Bash 密集调用区段（连续调用间隔 < gap_seconds）"""
+    if not bash_commands:
+        return []
+    sorted_cmds = sorted(bash_commands, key=lambda x: x["ts"] or datetime.min)
+    clusters = []
+    current = [sorted_cmds[0]]
+    for cmd in sorted_cmds[1:]:
+        if cmd["ts"] and current[-1]["ts"]:
+            gap = (cmd["ts"] - current[-1]["ts"]).total_seconds()
+            if gap < gap_seconds:
+                current.append(cmd)
+                continue
+        if len(current) >= 3:
+            clusters.append(current)
+        current = [cmd]
+    if len(current) >= 3:
+        clusters.append(current)
+    return clusters
+
+
+def analyze_bash_quality(bash_commands):
+    """分析 Bash 调用质量"""
+    if not bash_commands:
+        return {}
+
+    could_be_read = [c for c in bash_commands if c["could_be_read"]]
+    explore_only = [c for c in bash_commands if c["is_explore"] and not c["could_be_read"]]
+    dangerous = [c for c in bash_commands if c["is_dangerous"]]
+
+    clusters = find_bash_clusters(bash_commands)
+    # 只找出 could_be_read 的密集区段
+    cr_clusters = find_bash_clusters(could_be_read)
+    total = len(bash_commands)
+
+    return {
+        "total": total,
+        "could_be_read_count": len(could_be_read),
+        "could_be_read_pct": len(could_be_read) / total * 100 if total else 0,
+        "explore_count": len(explore_only),
+        "dangerous_count": len(dangerous),
+        "clusters": clusters,
+        "worst_cluster": max(cr_clusters, key=len) if cr_clusters else None,
+    }
+
+
+def analyze_message_patterns(turns, target_date=None):
+    """分析消息模式"""
+    if target_date:
+        day_turns = [t for t in turns if t["ts"] and t["ts"].date() == target_date]
+    else:
+        day_turns = turns
+
+    # 找出连续用户短消息（< 20 字，连续 3+ 条）
+    # 注意：turns 里只有类型，没有内容长度，这里简化处理
+    # 统计用户-助手轮次比
+    user_turns = [t for t in day_turns if t["type"] == "user"]
+    assist_turns = [t for t in day_turns if t["type"] == "assistant"]
+
+    # 找出连续 assistant tool_use（说明 Claude 在疯狂调用工具）
+    tool_runs = 0
+    max_consecutive_tools = 0
+    current_tools = 0
+    for t in day_turns:
+        if t["type"] == "assistant" and t.get("has_tool"):
+            current_tools += 1
+            max_consecutive_tools = max(max_consecutive_tools, current_tools)
+        else:
+            if current_tools > 0:
+                tool_runs += 1
+            current_tools = 0
+
+    return {
+        "user_turns": len(user_turns),
+        "assist_turns": len(assist_turns),
+        "tool_runs": tool_runs,
+        "max_consecutive_tools": max_consecutive_tools,
+    }
+
+
+def extract_friction_advice(items):
+    """从 facet 数据提取摩擦分析和改进建议"""
+    all_frics = Counter()
+    fric_details = []
+
+    for it in items:
+        f = it["facet"]
+        if not f:
+            continue
+        fc = f.get("friction_counts", {})
+        for k, v in fc.items():
+            all_frics[k] += v
+        detail = f.get("friction_detail")
+        if detail:
+            fric_details.append((it["session_id"][:8], detail))
+
+    if not all_frics:
+        return None
+
+    # 找出最严重的摩擦类型
+    top_fric = all_frics.most_common(1)[0]
+    fric_type, fric_count = top_fric
+
+    advice = FRICTION_ADVICE.get(fric_type, {
+        "观察": f"出现 {fric_count} 次 {fric_type} 摩擦",
+        "约束": "回顾今天的会话，找出触发点并设定规避策略",
+    })
+
+    return {
+        "top_type": fric_type,
+        "top_count": fric_count,
+        "total_frics": dict(all_frics.most_common()),
+        "details": fric_details,
+        "observation": advice["观察"],
+        "constraint": advice["约束"],
+    }
 
 
 def health_status(total):
@@ -216,20 +477,39 @@ def gen_report_markdown(target_date, items, prev_items=None):
         lines.append("- 约束：")
         return "\n".join(lines) + "\n"
 
-    total, dur_min, user_msgs = daily_stats(items)
+    stats = daily_stats(items, target_date)
+    total = stats["total"]
+    dur_min = stats["dur_min"]
+    user_msgs = stats["user_msgs"]
     bash = total.get("Bash", 0)
     read = total.get("Read", 0)
     edit = total.get("Edit", 0)
     write = total.get("Write", 0)
 
-    lines.append("## 今天做了什么")
+    # === 深度分析 ===
+    bash_analysis = analyze_bash_quality(stats["bash_commands"])
+    msg_patterns = analyze_message_patterns(stats["message_turns"], target_date)
+    friction = extract_friction_advice(items)
+
+    # === 概览 ===
+    lines.append("## 概览")
     lines.append("")
     proj_counts = Counter(it["project"] for it in items)
     proj_summary = "、".join(f"{p}({c})" for p, c in proj_counts.most_common())
-    lines.append(f"**{len(items)} 个有效会话 · {dur_min} 分钟 · 用户消息 {user_msgs} 条**")
+    # 时间范围
+    earliest = stats.get("earliest_ts")
+    latest = stats.get("latest_ts")
+    if earliest and latest:
+        time_range = f"{earliest.strftime('%H:%M')}–{latest.strftime('%H:%M')}"
+        dur_text = f"活跃 {dur_min} 分钟（{time_range}）"
+    else:
+        dur_text = f"活跃 {dur_min} 分钟"
+    lines.append(f"**{len(items)} 个有效会话 · {dur_text} · 用户消息 {user_msgs} 条 · {sum(total.values())} 次工具调用**")
     lines.append("")
     lines.append(f"项目分布：{proj_summary}")
     lines.append("")
+
+    # === 主要任务 ===
     lines.append("主要任务（按时间倒序）：")
     for it in items[:10]:
         t = it["parsed"]["first_ts"].strftime("%H:%M") if it["parsed"]["first_ts"] else "??:??"
@@ -239,24 +519,37 @@ def gen_report_markdown(target_date, items, prev_items=None):
         lines.append(f"- ...另有 {len(items) - 10} 个会话")
     lines.append("")
 
-    lines.append("## 数据健康度")
+    # === 数据快照 ===
+    lines.append("## 数据快照")
     lines.append("")
-    lines.append("| 指标 | 今天 | 健康基线 | 状态 |")
-    lines.append("|---|---|---|---|")
+    lines.append("| 指标 | 今天 | 状态 |")
+    lines.append("|---|---|---|")
     ratio = bash_read_ratio(total)
     ratio_str = f"{ratio:.1f}" if isinstance(ratio, float) and ratio != float("inf") else ("∞" if ratio == float("inf") else "-")
     ratio_warn = "✅" if ratio is None or (isinstance(ratio, float) and ratio <= HEALTHY_BASH_READ_RATIO) else "⚠️"
-    lines.append(f"| Bash/Read 比 | {ratio_str} | < {HEALTHY_BASH_READ_RATIO} | {ratio_warn} |")
+    lines.append(f"| Bash/Read 比 | {bash}:{read} ({ratio_str}) | {ratio_warn} |")
     msgs_warn = "✅" if user_msgs <= HEALTHY_DAILY_MSGS else "⚠️"
-    lines.append(f"| 用户消息数 | {user_msgs} | < {HEALTHY_DAILY_MSGS} | {msgs_warn} |")
-    lines.append(f"| 总工具调用 | {sum(total.values())} | - | - |")
-    lines.append(f"| Bash · Read · Edit · Write | {bash} · {read} · {edit} · {write} | - | - |")
+    lines.append(f"| 用户消息数 | {user_msgs} | {msgs_warn} |")
+    lines.append(f"| 活跃时长 | {dur_min} 分钟 | - |")
+    lines.append(f"| 工具调用 | Bash {bash} · Read {read} · Edit {edit} · Write {write} | - |")
+
+    # Bash 质量细分
+    if bash_analysis.get("total", 0) > 0:
+        cr = bash_analysis["could_be_read_count"]
+        cr_pct = bash_analysis["could_be_read_pct"]
+        lines.append(f"| Bash 质量 | {cr}/{bash} 本可用 Read ({cr_pct:.0f}%) | {'⚠️' if cr_pct > 30 else '✅'} |")
+    if msg_patterns["max_consecutive_tools"] > 5:
+        lines.append(f"| 工具连发 | 最多连续 {msg_patterns['max_consecutive_tools']} 轮工具调用 | ⚠️ |")
     lines.append("")
 
+    # === 对比昨天 ===
     if prev_items is not None:
         prev_clean = [it for it in prev_items if not is_noise(it)]
         if prev_clean:
-            prev_total, prev_dur, prev_msgs = daily_stats(prev_clean)
+            prev_stats = daily_stats(prev_clean, target_date - timedelta(days=1))
+            prev_total = prev_stats["total"]
+            prev_dur = prev_stats["dur_min"]
+            prev_msgs = prev_stats["user_msgs"]
             prev_ratio = bash_read_ratio(prev_total)
             lines.append("**跟昨天对比：**")
             lines.append("")
@@ -267,60 +560,88 @@ def gen_report_markdown(target_date, items, prev_items=None):
             delta_msgs = user_msgs - prev_msgs
             lines.append(f"- 用户消息: {user_msgs} ← {prev_msgs}  ({delta_msgs:+d})")
             delta_dur = dur_min - prev_dur
-            lines.append(f"- 时长: {dur_min} ← {prev_dur} 分钟  ({delta_dur:+d})")
+            lines.append(f"- 活跃时长: {dur_min} ← {prev_dur} 分钟  ({delta_dur:+d})")
             lines.append("")
 
-    lines.append("## 检测到的问题")
+    # === 今天的主要摩擦（核心改进） ===
+    lines.append("## 今天的主要摩擦")
     lines.append("")
+
     problems = []
-    if isinstance(ratio, float) and ratio > HEALTHY_BASH_READ_RATIO:
-        worst = sorted(items, key=lambda it: it["parsed"]["tool_counts"].get("Bash", 0), reverse=True)[:3]
-        worst_str = "、".join(f"`{it['session_id'][:8]}`(Bash×{it['parsed']['tool_counts'].get('Bash',0)})" for it in worst)
-        problems.append(f"**Bash 滥用**：今天 Bash {bash} 次 vs Read {read} 次。Bash 用得最多的会话：{worst_str}。这些里有多少是本可以 Read/Grep 的？")
+
+    # 1. Bash 滥用（精准定位）
+    if bash_analysis.get("could_be_read_count", 0) >= 3:
+        worst = bash_analysis.get("worst_cluster")
+        if worst:
+            t = worst[0]["ts"].strftime("%H:%M") if worst[0]["ts"] else "??:??"
+            sample_cmds = [short(c["cmd"], 40) for c in worst[:3]]
+            problems.append(f"**Bash 本可用 Read**：{bash_analysis['could_be_read_count']} 条 Bash 命令本可用 Read/Grep 替代。最密集区段 `{t}` 连续 {len(worst)} 条：{'；'.join(sample_cmds)}")
+        else:
+            problems.append(f"**Bash 本可用 Read**：{bash_analysis['could_be_read_count']} 条 Bash 命令本可用 Read/Grep 替代")
+
+    # 2. 消息密度
     if user_msgs > HEALTHY_DAILY_MSGS:
         avg = user_msgs / max(len(items), 1)
         problems.append(f"**消息密度高**：{user_msgs} 条消息 / {len(items)} 会话 ≈ 每会话 {avg:.0f} 条。说明你在反复修正而不是一次说清。")
+
+    # 3. 频繁打断
     interrupts = sum(it["parsed"]["interruptions"] for it in items)
     if interrupts > 3:
         problems.append(f"**频繁打断**：今天打断 Claude {interrupts} 次。说明你扔出去的 prompt 跟你想要的不匹配，从源头改 prompt 更省力。")
+
+    # 4. 只探索没落地
     edit_write = edit + write
-    if edit_write < 5 and dur_min > 120:
+    if edit_write < 5 and dur_min > 60:
         problems.append(f"**只在探索没在改代码**：{dur_min} 分钟但 Edit/Write 只有 {edit_write} 次。今天主要在调试/搜索/聊天，不在落地实现。")
-    if not problems:
+
+    # 5. 工具连发
+    if msg_patterns["max_consecutive_tools"] > 8:
+        problems.append(f"**工具连发**：最多连续 {msg_patterns['max_consecutive_tools']} 轮工具调用，Claude 可能在兜圈子或没理解目标。")
+
+    # 6. facet 摩擦
+    if friction:
+        fric_summary = ", ".join(f"{k}×{v}" for k, v in list(friction["total_frics"].items())[:3])
+        problems.append(f"**会话摩擦**：{fric_summary}")
+        if friction["details"]:
+            sid, detail = friction["details"][0]
+            problems.append(f"  - 典型例子 (`{sid}`)：{short(detail, 100)}")
+    elif not problems:
         problems.append("数据上没自动发现明显问题。今天可能用得不错，或者数据信号弱。")
+
     for p in problems:
         lines.append(f"- {p}")
     lines.append("")
 
-    lines.append("## 给你的改进建议")
+    # === 明天的改进候选（预填充，核心改进） ===
+    lines.append("## 明天的改进候选")
     lines.append("")
+
+    # 基于摩擦数据或问题检测生成精准建议
     suggestions = []
-    if isinstance(ratio, float) and ratio > HEALTHY_BASH_READ_RATIO:
-        suggestions.append("明天开会话第一句加上：**'诊断前先一句假设，能 Read/Grep 就别 Bash。'**")
-    if user_msgs > HEALTHY_DAILY_MSGS:
-        suggestions.append("明天试一次：开新会话前先在 daily-improvement.md 写 3 行需求草稿再发，不要随手就发。")
-    if interrupts > 3:
-        suggestions.append("明天每次想打断 Claude 时，先问自己：'是 Claude 跑偏了，还是我没说清？' 是后者就记下来。")
-    if edit_write < 5 and dur_min > 120 and len(items) > 0:
-        suggestions.append("明天开会话前先决定：**今天是要落地东西，还是要调试基础设施。** 不要混在一起。")
-    if not suggestions:
-        suggestions.append("今天没明显坏习惯。明天保持今天的节奏即可。")
+
+    if friction:
+        suggestions.append(f"**{friction['observation']}** —— {friction['constraint']}")
+    elif bash_analysis.get("could_be_read_count", 0) >= 3:
+        suggestions.append("**Bash 滥用** —— 下次想敲 Bash 前停 3 秒：这个命令是不是在'读文件'？是的话用 Read/Grep。")
+    elif user_msgs > HEALTHY_DAILY_MSGS:
+        suggestions.append("**消息太多** —— 开新会话前写 3 行需求草稿：目标、约束、验收标准。")
+    elif interrupts > 3:
+        suggestions.append("**频繁打断** —— 想打断时先问自己：是 Claude 跑偏了，还是我没说清？")
+    elif edit_write < 5 and dur_min > 60:
+        suggestions.append("**落地不足** —— 开会话前先决定：今天要输出什么？不要混在探索里。")
+    else:
+        suggestions.append("今天没明显坏习惯。明天保持节奏即可。")
+
     for s in suggestions:
         lines.append(f"- {s}")
     lines.append("")
 
-    facet_frics = []
-    for it in items:
-        f = it["facet"]
-        if f and f.get("session_id") == it["session_id"]:
-            fr = f.get("friction_detail")
-            if fr:
-                facet_frics.append((it["session_id"][:8], fr))
-    if facet_frics:
-        lines.append("## /insight 给出的摩擦细节（如果有）")
+    # === /insight 摩擦详情 ===
+    if friction and friction["details"]:
+        lines.append("## /insight 摩擦详情")
         lines.append("")
-        for sid, fr in facet_frics:
-            lines.append(f"- `{sid}` {fr}")
+        for sid, detail in friction["details"][:5]:
+            lines.append(f"- `{sid}` {short(detail, 120)}")
         lines.append("")
 
     lines.append(REGEN_MARKER)
@@ -329,8 +650,20 @@ def gen_report_markdown(target_date, items, prev_items=None):
     lines.append("")
     lines.append("## 你的反思")
     lines.append("")
-    lines.append("- 观察：")
-    lines.append("- 约束：")
+
+    # 预填充反思区
+    if friction:
+        lines.append(f"- 观察：{friction['observation']}（{friction['top_type']} ×{friction['top_count']}）")
+        lines.append(f"- 约束：{friction['constraint']}")
+    elif bash_analysis.get("could_be_read_count", 0) >= 3:
+        lines.append(f"- 观察：今天 {bash_analysis['could_be_read_count']} 条 Bash 本可用 Read 替代")
+        lines.append("- 约束：读文件用 Read，只有系统命令才用 Bash")
+    elif user_msgs > HEALTHY_DAILY_MSGS:
+        lines.append("- 观察：消息密度高，反复修正")
+        lines.append("- 约束：一次说清，不要逐句投喂")
+    else:
+        lines.append("- 观察：")
+        lines.append("- 约束：")
     lines.append("")
 
     return "\n".join(lines) + "\n"
@@ -354,11 +687,21 @@ def print_summary(target_date, items):
     if not items:
         print(f"📅 {target_date}：没有有效会话")
         return
-    total, dur_min, user_msgs = daily_stats(items)
+    stats = daily_stats(items, target_date)
+    total = stats["total"]
+    dur_min = stats["dur_min"]
+    user_msgs = stats["user_msgs"]
     ratio = bash_read_ratio(total)
     ratio_str = f"{ratio:.1f}" if isinstance(ratio, float) and ratio != float("inf") else "-"
     status = health_status(total)
-    print(f"📅 {target_date} | {len(items)} 会话 | {dur_min} 分钟 | {user_msgs} 消息 | Bash/Read {ratio_str} | {status}")
+    bash_analysis = analyze_bash_quality(stats["bash_commands"])
+    fric = extract_friction_advice(items)
+    extra = ""
+    if bash_analysis.get("could_be_read_count", 0) > 0:
+        extra += f" | Read替Bash:{bash_analysis['could_be_read_count']}"
+    if fric:
+        extra += f" | 摩擦:{fric['top_type']}×{fric['top_count']}"
+    print(f"📅 {target_date} | {len(items)} 会话 | {dur_min} 分钟 | {user_msgs} 消息 | Bash/Read {ratio_str}{extra} | {status}")
 
 
 def main():
