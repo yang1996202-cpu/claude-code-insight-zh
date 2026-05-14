@@ -29,6 +29,7 @@ REPORTS_DIR.mkdir(exist_ok=True)
 
 HEALTHY_BASH_READ_RATIO = 2.0
 HEALTHY_MSGS_PER_SESSION = 40  # 每会话阈值，比每天总量更合理
+HEALTHY_ACHIEVEMENT_RATE = 0.70  # 达成率健康阈值
 
 # 用户反思区域的分隔标记
 USER_MARKER = "<!-- 下面是你的反思区，Claude 不会覆盖 -->"
@@ -467,6 +468,73 @@ def extract_friction_advice(items):
     }
 
 
+def extract_outcome_stats(items):
+    """从 facet 数据提取达成与结果统计"""
+    outcomes = Counter()
+    unachieved = []  # (session_id, brief_summary, friction_detail)
+    total_satisfaction = Counter()
+    sessions_with_facet = 0
+
+    for it in items:
+        f = it["facet"]
+        if not f:
+            continue
+        sessions_with_facet += 1
+
+        outcome = f.get("outcome")
+        if outcome:
+            outcomes[outcome] += 1
+
+        # 收集未达成会话
+        if outcome in ("not_achieved", "abandoned"):
+            summary = f.get("brief_summary", "")
+            fric_detail = f.get("friction_detail", "")
+            unachieved.append((
+                it["session_id"][:8],
+                summary,
+                fric_detail,
+            ))
+
+        # 满意度
+        sat = f.get("user_satisfaction_counts", {})
+        for k, v in sat.items():
+            total_satisfaction[k] += v
+
+    if sessions_with_facet == 0:
+        return None
+
+    total = sessions_with_facet
+    fully = outcomes.get("fully_achieved", 0)
+    partially = outcomes.get("partially_achieved", 0)
+    not_achieved = outcomes.get("not_achieved", 0)
+    abandoned = outcomes.get("abandoned", 0)
+    mostly = outcomes.get("mostly_achieved", 0)
+    unclear = outcomes.get("unclear_from_transcript", 0)
+
+    achievement_rate = (fully + mostly) / total if total else 0
+
+    satisfied = total_satisfaction.get("satisfied", 0)
+    likely_sat = total_satisfaction.get("likely_satisfied", 0)
+    satisfaction_total = satisfied + likely_sat
+    satisfaction_rate = satisfied / satisfaction_total if satisfaction_total else None
+
+    return {
+        "total": total,
+        "fully_achieved": fully,
+        "partially_achieved": partially,
+        "not_achieved": not_achieved,
+        "abandoned": abandoned,
+        "mostly_achieved": mostly,
+        "unclear": unclear,
+        "outcomes": dict(outcomes),
+        "achievement_rate": achievement_rate,
+        "unachieved": unachieved,
+        "satisfied": satisfied,
+        "likely_satisfied": likely_sat,
+        "satisfaction_rate": satisfaction_rate,
+    }
+
+
 def health_status(total):
     ratio = bash_read_ratio(total)
     if ratio is None:
@@ -539,6 +607,42 @@ def gen_report_markdown(target_date, items, prev_items=None):
         lines.append(f"- ...另有 {len(items) - 10} 个会话")
     lines.append("")
 
+    # === 达成与结果 ===
+    outcome_stats = extract_outcome_stats(items)
+    lines.append("## 达成与结果")
+    lines.append("")
+    if outcome_stats is None:
+        lines.append("今天没有会话评估数据（facet 未生成或不可用）。")
+        lines.append("")
+    else:
+        o = outcome_stats
+        parts = []
+        if o["fully_achieved"]:
+            parts.append(f"完全达成 {o['fully_achieved']}")
+        if o["mostly_achieved"]:
+            parts.append(f"大部分达成 {o['mostly_achieved']}")
+        if o["partially_achieved"]:
+            parts.append(f"部分达成 {o['partially_achieved']}")
+        if o["not_achieved"]:
+            parts.append(f"未达成 {o['not_achieved']}")
+        if o["abandoned"]:
+            parts.append(f"放弃 {o['abandoned']}")
+        if o["unclear"]:
+            parts.append(f"不清楚 {o['unclear']}")
+        lines.append("**结果分布**：" + (" · ".join(parts) if parts else "无数据"))
+        lines.append("")
+        lines.append(f"**达成率**：{o['achievement_rate']*100:.0f}%（完全达成 / 有评估会话）")
+        if o["satisfaction_rate"] is not None:
+            lines.append(f"**满意度**：{o['satisfied']}/{o['satisfied']+o['likely_satisfied']} 明确满意")
+        lines.append("")
+        if o["unachieved"]:
+            lines.append("**未达成会话**：")
+            for sid, summary, fric in o["unachieved"]:
+                s = short(summary, 60)
+                extra = f" — {short(fric, 60)}" if fric else ""
+                lines.append(f"- `{sid}` {s}{extra}")
+            lines.append("")
+
     # === 数据快照 ===
     lines.append("## 数据快照")
     lines.append("")
@@ -553,6 +657,10 @@ def gen_report_markdown(target_date, items, prev_items=None):
     lines.append(f"| 用户消息数 | {user_msgs} | {msgs_warn} |")
     lines.append(f"| 活跃时长 | {dur_min} 分钟 | - |")
     lines.append(f"| 工具调用 | Bash {bash} · Read {read} · Edit {edit} · Write {write} | - |")
+    if outcome_stats:
+        ar = outcome_stats["achievement_rate"]
+        ar_warn = "✅" if ar >= HEALTHY_ACHIEVEMENT_RATE else "⚠️"
+        lines.append(f"| 达成率 | {ar*100:.0f}% | {ar_warn} |")
 
     # Bash 质量细分
     if bash_analysis.get("total", 0) > 0:
@@ -680,7 +788,7 @@ def gen_report_markdown(target_date, items, prev_items=None):
     elif bash_analysis.get("could_be_read_count", 0) >= 3:
         lines.append(f"- 观察：今天 {bash_analysis['could_be_read_count']} 条 Bash 本可用 Read 替代")
         lines.append("- 约束：读文件用 Read，只有系统命令才用 Bash")
-    elif user_msgs > HEALTHY_DAILY_MSGS:
+    elif avg_msgs > HEALTHY_MSGS_PER_SESSION:
         lines.append("- 观察：消息密度高，反复修正")
         lines.append("- 约束：一次说清，不要逐句投喂")
     else:
