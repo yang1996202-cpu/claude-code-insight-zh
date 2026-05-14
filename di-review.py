@@ -125,6 +125,9 @@ def parse_jsonl(path: Path):
     bash_commands = []  # [(timestamp, command, could_be_read)]
     read_files = []     # [(timestamp, file_path)]
     message_turns = []  # [{'ts': datetime, 'type': 'user'|'assistant', 'has_tool': bool}]
+    # 按日期分组的统计（用于跨天会话精准计算）
+    tools_by_ts = []    # [(ts, tool_name)]
+    user_msg_ts = []    # [ts]
 
     for line in path.open(encoding="utf-8", errors="ignore"):
         try:
@@ -147,6 +150,8 @@ def parse_jsonl(path: Path):
 
         if msg_type == "user":
             user_msgs += 1
+            if dt:
+                user_msg_ts.append(dt)
             if first_user is None:
                 content = d.get("message", {}).get("content")
                 if isinstance(content, str):
@@ -175,6 +180,8 @@ def parse_jsonl(path: Path):
                         has_tool_use = True
                         tool_name = block.get("name", "?")
                         tool_counts[tool_name] += 1
+                        if dt:
+                            tools_by_ts.append((dt, tool_name))
                         tool_input = block.get("input", {})
 
                         if tool_name == "Bash" and isinstance(tool_input, dict):
@@ -207,6 +214,8 @@ def parse_jsonl(path: Path):
         "bash_commands": bash_commands,
         "read_files": read_files,
         "message_turns": message_turns,
+        "tools_by_ts": tools_by_ts,
+        "user_msg_ts": user_msg_ts,
     }
 
 
@@ -269,9 +278,13 @@ def daily_stats(items, target_date=None):
 
     for it in items:
         p = it["parsed"]
-        for k, v in p["tool_counts"].items():
-            total[k] += v
-        user_msgs += p["user_msgs"]
+        # 只统计当天的工具调用和用户消息
+        for ts, tool_name in p.get("tools_by_ts", []):
+            if target_date is None or ts.date() == target_date:
+                total[tool_name] += 1
+        for ts in p.get("user_msg_ts", []):
+            if target_date is None or ts.date() == target_date:
+                user_msgs += 1
 
         # 修复时长计算：只统计目标日期内的消息时间，并分段（间隔>30分钟视为中断）
         if target_date:
@@ -293,12 +306,19 @@ def daily_stats(items, target_date=None):
             if p["first_ts"] and p["last_ts"]:
                 dur_min += (p["last_ts"] - p["first_ts"]).total_seconds() / 60
 
-        all_bash.extend(p["bash_commands"])
-        all_reads.extend(p["read_files"])
-        all_turns.extend(p["message_turns"])
+        # 只收集当天的 Bash/Read/turns
+        for bc in p["bash_commands"]:
+            if target_date is None or (bc["ts"] and bc["ts"].date() == target_date):
+                all_bash.append(bc)
+        for rf in p["read_files"]:
+            if target_date is None or (rf["ts"] and rf["ts"].date() == target_date):
+                all_reads.append(rf)
+        for turn in p["message_turns"]:
+            if target_date is None or (turn["ts"] and turn["ts"].date() == target_date):
+                all_turns.append(turn)
 
     # 计算当天最早和最晚消息时间
-    all_day_ts = sorted([t["ts"] for t in all_turns if t["ts"] and (target_date is None or t["ts"].date() == target_date)])
+    all_day_ts = sorted([t["ts"] for t in all_turns if t["ts"]])
     earliest_ts = all_day_ts[0] if all_day_ts else None
     latest_ts = all_day_ts[-1] if all_day_ts else None
 
