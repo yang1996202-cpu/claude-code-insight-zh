@@ -28,7 +28,7 @@ REPORTS_DIR = CLAUDE_DIR / "daily-reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
 HEALTHY_BASH_READ_RATIO = 2.0
-HEALTHY_DAILY_MSGS = 80
+HEALTHY_MSGS_PER_SESSION = 40  # 每会话阈值，比每天总量更合理
 
 # 用户反思区域的分隔标记
 USER_MARKER = "<!-- 下面是你的反思区，Claude 不会覆盖 -->"
@@ -548,7 +548,8 @@ def gen_report_markdown(target_date, items, prev_items=None):
     ratio_str = f"{ratio:.1f}" if isinstance(ratio, float) and ratio != float("inf") else ("∞" if ratio == float("inf") else "-")
     ratio_warn = "✅" if ratio is None or (isinstance(ratio, float) and ratio <= HEALTHY_BASH_READ_RATIO) else "⚠️"
     lines.append(f"| Bash/Read 比 | {bash}:{read} ({ratio_str}) | {ratio_warn} |")
-    msgs_warn = "✅" if user_msgs <= HEALTHY_DAILY_MSGS else "⚠️"
+    avg_msgs = user_msgs / max(len(items), 1)
+    msgs_warn = "✅" if avg_msgs <= HEALTHY_MSGS_PER_SESSION else "⚠️"
     lines.append(f"| 用户消息数 | {user_msgs} | {msgs_warn} |")
     lines.append(f"| 活跃时长 | {dur_min} 分钟 | - |")
     lines.append(f"| 工具调用 | Bash {bash} · Read {read} · Edit {edit} · Write {write} | - |")
@@ -600,7 +601,8 @@ def gen_report_markdown(target_date, items, prev_items=None):
             problems.append(f"**Bash 本可用 Read**：{bash_analysis['could_be_read_count']} 条 Bash 命令本可用 Read/Grep 替代")
 
     # 2. 消息密度
-    if user_msgs > HEALTHY_DAILY_MSGS:
+    avg_msgs = user_msgs / max(len(items), 1)
+    if avg_msgs > HEALTHY_MSGS_PER_SESSION:
         avg = user_msgs / max(len(items), 1)
         problems.append(f"**消息密度高**：{user_msgs} 条消息 / {len(items)} 会话 ≈ 每会话 {avg:.0f} 条。说明你在反复修正而不是一次说清。")
 
@@ -641,9 +643,9 @@ def gen_report_markdown(target_date, items, prev_items=None):
 
     if friction:
         suggestions.append(f"**{friction['observation']}** —— {friction['constraint']}")
-    elif bash_analysis.get("could_be_read_count", 0) >= 3:
+    elif bash_analysis.get("could_be_read_count", 0) >= 10 or bash_analysis.get("could_be_read_pct", 0) > 15:
         suggestions.append("**Bash 滥用** —— 下次想敲 Bash 前停 3 秒：这个命令是不是在'读文件'？是的话用 Read/Grep。")
-    elif user_msgs > HEALTHY_DAILY_MSGS:
+    elif avg_msgs > HEALTHY_MSGS_PER_SESSION:
         suggestions.append("**消息太多** —— 开新会话前写 3 行需求草稿：目标、约束、验收标准。")
     elif interrupts > 3:
         suggestions.append("**频繁打断** —— 想打断时先问自己：是 Claude 跑偏了，还是我没说清？")
