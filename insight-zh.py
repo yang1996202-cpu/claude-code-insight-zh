@@ -221,6 +221,161 @@ def load_data(start_d, end_d):
     return items
 
 
+# ── JSONL 数据源（Claude Code 2.1.140+ 新格式）──
+
+def load_data_from_jsonl(start_d, end_d):
+    """从 ~/.claude/projects/*/*.jsonl 解析会话数据。
+    返回与 load_data 兼容的 {facet, meta, date} 列表。
+    """
+    items = []
+    projects_dir = CLAUDE_DIR / "projects"
+    if not projects_dir.exists():
+        return items
+
+    for jsonl_path in projects_dir.rglob("*.jsonl"):
+        try:
+            session_id = jsonl_path.stem
+            user_msgs = 0
+            assist_msgs = 0
+            tool_counts = Counter()
+            first_ts = None
+            last_ts = None
+            first_prompt = ""
+            cwd = ""
+            version = ""
+            git_branch = ""
+
+            with open(jsonl_path, "r", encoding="utf-8") as fp:
+                for line in fp:
+                    if not line.strip():
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+
+                    ts_str = d.get("timestamp")
+                    if ts_str:
+                        try:
+                            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                            if first_ts is None or ts < first_ts:
+                                first_ts = ts
+                            if last_ts is None or ts > last_ts:
+                                last_ts = ts
+                        except Exception:
+                            pass
+
+                    t = d.get("type")
+                    if t == "user":
+                        user_msgs += 1
+                        if not first_prompt:
+                            msg = d.get("message", {})
+                            content = msg.get("content", "")
+                            if isinstance(content, str):
+                                first_prompt = content.strip()
+                            elif isinstance(content, list) and content:
+                                first_prompt = str(content[0]).strip()
+                    elif t == "assistant":
+                        assist_msgs += 1
+                        msg = d.get("message", {})
+                        content = msg.get("content", [])
+                        for c in content:
+                            if c.get("type") == "tool_use":
+                                tool_counts[c.get("name", "unknown")] += 1
+
+                    if not cwd:
+                        cwd = d.get("cwd", "")
+                    if not version:
+                        version = d.get("version", "")
+                    if not git_branch:
+                        git_branch = d.get("gitBranch", "")
+
+            if first_ts is None:
+                continue
+
+            dt = first_ts.astimezone().date()
+            if start_d and dt < start_d:
+                continue
+            if dt > end_d:
+                continue
+
+            # 过滤噪音：空会话、技能触发、测试输入
+            if user_msgs == 0:
+                continue
+            if first_prompt.startswith("<") and ">" in first_prompt:
+                # 技能触发消息如 <command-message>...
+                continue
+
+            # 计算时长（上限 12 小时，防止跨天 session 失真）
+            dur_min = 0
+            if last_ts:
+                dur_min = int((last_ts - first_ts).total_seconds() / 60)
+                if dur_min > 12 * 60:
+                    dur_min = 12 * 60
+
+            # 推断会话类型
+            session_type = "single_task"
+            if user_msgs > 30:
+                session_type = "multi_task"
+            elif user_msgs < 5 and assist_msgs < 10:
+                session_type = "quick_question"
+            elif tool_counts.get("Bash", 0) > 20 or tool_counts.get("Read", 0) > 15:
+                session_type = "exploration"
+            elif any(t in tool_counts for t in ["Edit", "Write"]):
+                session_type = "iterative_refinement"
+
+            # 推断目标（从第一条用户消息）
+            goal = first_prompt[:120] if first_prompt else "未记录"
+
+            # 构造 facet（兼容旧格式，但标记为 jsonl 来源）
+            facet = {
+                "session_id": session_id,
+                "session_type": session_type,
+                "underlying_goal": goal,
+                "brief_summary": goal,
+                "outcome": "unclear_from_transcript",
+                "claude_helpfulness": "helpful",
+                "primary_success": "none",
+                "friction_counts": {},
+                "friction_detail": "",
+                "goal_categories": {},
+                "user_satisfaction_counts": {},
+                "_source": "jsonl",
+            }
+
+            # 构造 meta
+            meta = {
+                "session_id": session_id,
+                "project_path": cwd,
+                "start_time": first_ts.isoformat() if first_ts else "",
+                "duration_minutes": dur_min,
+                "user_message_count": user_msgs,
+                "assistant_message_count": assist_msgs,
+                "tool_counts": dict(tool_counts),
+                "languages": {},
+                "git_commits": 0,
+                "git_pushes": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "first_prompt": first_prompt[:200],
+                "user_interruptions": 0,
+                "user_response_times": [],
+                "tool_errors": 0,
+                "tool_error_categories": {},
+                "uses_task_agent": bool(tool_counts.get("Agent") or tool_counts.get("TaskCreate")),
+                "uses_mcp": False,
+                "version": version,
+                "git_branch": git_branch,
+            }
+
+            items.append({"facet": facet, "meta": meta, "date": dt})
+        except Exception:
+            continue
+
+    items.sort(key=lambda x: x["date"] or date.min, reverse=True)
+    return items
+
+
 def fmt_bar(v, max_v, width=30):
     if max_v <= 0:
         return ""
@@ -556,7 +711,11 @@ def generate_report(items, translations=None):
     lines.append(f"")
     lines.append(f"**{n} 个会话 · {first_date} 至 {last_date} · {total_user_msgs} 条用户消息 · {total_dur} 分钟 · {total_commits} 个 commit**")
     lines.append(f"")
-    lines.append(f"> 数据范围说明：本报告基于 `/insight` 已分析的 {n} 个会话（facets 数据）。Claude App 显示你有更多跨平台会话，此处仅包含 Claude Code CLI。")
+    has_jsonl = any(it.get("facet", {}).get("_source") == "jsonl" for it in items)
+    if has_jsonl:
+        lines.append(f"> 数据范围说明：本报告基于 `~/.claude/projects/*.jsonl` 原始会话数据，共 {n} 个会话。部分字段（如目标分类、摩擦点）由启发式规则推断。不含 Claude App（桌面端/网页端）会话。")
+    else:
+        lines.append(f"> 数据范围说明：本报告基于 `/insight` 已分析的 {n} 个会话（facets 数据）。Claude App 显示你有更多跨平台会话，此处仅包含 Claude Code CLI。")
     lines.append(f"")
 
     # ── 概览 ──
@@ -788,9 +947,11 @@ def generate_report(items, translations=None):
         lines.append("")
 
     # ── 底部 ──
+    has_jsonl = any(it.get("facet", {}).get("_source") == "jsonl" for it in items)
+    data_source = "~/.claude/projects/*/*.jsonl（原始会话数据）" if has_jsonl else "~/.claude/usage-data/facets/ + session-meta/"
     lines.append("---")
     lines.append(f"\n报告生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    lines.append(f"数据来源：~/.claude/usage-data/facets/ + session-meta/")
+    lines.append(f"数据来源：{data_source}")
     lines.append(f"生成命令：insight-zh")
 
     return "\n".join(lines) + "\n"
@@ -1303,6 +1464,8 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         translations = {}
 
     n = len(items)
+    has_jsonl = any(it.get("facet", {}).get("_source") == "jsonl" for it in items)
+    data_source_html = "~/.claude/projects/*.jsonl（原始会话数据）" if has_jsonl else "Claude Code facets + session-meta"
     first_date = min(it["date"] for it in items if it["date"])
     last_date = max(it["date"] for it in items if it["date"])
 
@@ -1873,7 +2036,18 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         summary_html = f'<div class="section"><h2>会话摘要精选（{len(brief_summaries)} 条）</h2><div class="narrative">{rows}{more}</div></div>'
 
     # ── 新增：概览指标「怎么算的」展开详情 ──
-    ov_session_details = f"""
+    if has_jsonl:
+        ov_session_details = f"""
+    <details class="ov-details">
+      <summary>📐 这个数怎么算的？</summary>
+      <div class="method-text">
+        <strong>定义：</strong>从 Claude Code CLI 原始会话数据（jsonl）解析的会话数量。<br>
+        <strong>数据来源：</strong>~/.claude/projects/*/*.jsonl，共找到 {n} 个会话文件。<br>
+        <strong>注意：</strong>这是实时原始数据，非 /insight AI 分析结果。部分字段（如目标分类、摩擦点）由启发式规则推断，可能与 facets 数据有差异。
+      </div>
+    </details>"""
+    else:
+        ov_session_details = f"""
     <details class="ov-details">
       <summary>📐 这个数怎么算的？</summary>
       <div class="method-text">
@@ -2938,7 +3112,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
   {summary_html}
 
   <div class="footer">
-    生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')} · 数据来源：Claude Code facets + session-meta
+    生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')} · 数据来源：{data_source_html}
   </div>
 </div>
 </body>
@@ -2954,10 +3128,16 @@ def main():
         return
 
     start_d, end_d = resolve_range(args)
-    items = load_data(start_d, end_d)
+
+    # 优先尝试 JSONL 新数据源，无数据则回退到 facets
+    items = load_data_from_jsonl(start_d, end_d)
+    source_label = "jsonl"
+    if not items:
+        items = load_data(start_d, end_d)
+        source_label = "facets"
 
     translations = {}
-    if not args.no_translate and items:
+    if not args.no_translate and items and source_label == "facets":
         print(f"收集到 {len(items)} 个会话的 facets 数据，准备翻译...", file=sys.stderr)
         texts = collect_texts_to_translate(items)
         print(f"需要翻译的 unique 文本：{len(texts)} 条", file=sys.stderr)
