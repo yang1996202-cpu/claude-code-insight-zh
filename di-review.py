@@ -122,6 +122,7 @@ def parse_jsonl(path: Path):
     last_ts = None
     user_msgs = 0
     interruptions = 0
+    compact_count = 0
     # 消息级数据
     bash_commands = []  # [(timestamp, command, could_be_read)]
     read_files = []     # [(timestamp, file_path)]
@@ -129,6 +130,9 @@ def parse_jsonl(path: Path):
     # 按日期分组的统计（用于跨天会话精准计算）
     tools_by_ts = []    # [(ts, tool_name)]
     user_msg_ts = []    # [ts]
+    user_msg_texts = [] # [(ts, text)] 用户消息文本，用于内容分析
+    edited_files = []   # [(ts, file_path)] Edit 修改的文件
+    written_files = []  # [(ts, file_path)] Write 写入的文件
 
     for line in path.open(encoding="utf-8", errors="ignore"):
         try:
@@ -153,18 +157,39 @@ def parse_jsonl(path: Path):
             user_msgs += 1
             if dt:
                 user_msg_ts.append(dt)
-            if first_user is None:
-                content = d.get("message", {}).get("content")
-                if isinstance(content, str):
-                    first_user = content
-                elif isinstance(content, list):
-                    for blk in content:
-                        if isinstance(blk, dict) and blk.get("type") == "text":
-                            first_user = blk.get("text", "")
-                            break
+            # 提取用户消息文本（过滤系统注入的 continuation 消息）
+            msg_text = ""
+            content = d.get("message", {}).get("content")
+            if isinstance(content, str):
+                msg_text = content
+            elif isinstance(content, list):
+                for blk in content:
+                    if isinstance(blk, dict) and blk.get("type") == "text":
+                        t = blk.get("text", "")
+                        msg_text += t + " "
+            msg_text = msg_text.strip()
+            # 过滤系统消息和引用块（特征：包含特定标记）
+            has_system_markers = (
+                "<local-command-" in msg_text or
+                "<command-message>" in msg_text or
+                "<command-name>" in msg_text or
+                "[2m" in msg_text or  # ANSI 转义码
+                "[22m" in msg_text or
+                "session is being continued" in msg_text.lower() or
+                "summary below covers" in msg_text.lower() or
+                "context was compacted" in msg_text.lower()
+            )
+            # 只保存看起来是真实用户输入的消息（用于内容分析）
+            # 长度限制：3-1000 字，排除系统消息
+            if msg_text and dt and not has_system_markers and 3 <= len(msg_text) <= 1000:
+                user_msg_texts.append({"ts": dt, "text": msg_text})
+            # 检测 /compact 命令
+            if "/compact" in msg_text or "/compact" in line:
+                compact_count += 1
+            if first_user is None and msg_text:
+                first_user = msg_text
             # 检查是否包含 tool_result（即对 assistant 工具的回应）
             has_tool_result = False
-            content = d.get("message", {}).get("content")
             if isinstance(content, list):
                 for blk in content:
                     if isinstance(blk, dict) and blk.get("type") == "tool_result":
@@ -200,6 +225,14 @@ def parse_jsonl(path: Path):
                             fp = tool_input.get("file_path", "")
                             if fp:
                                 read_files.append({"ts": dt, "path": fp})
+                        elif tool_name == "Edit" and isinstance(tool_input, dict):
+                            fp = tool_input.get("file_path", "")
+                            if fp:
+                                edited_files.append({"ts": dt, "path": fp})
+                        elif tool_name == "Write" and isinstance(tool_input, dict):
+                            fp = tool_input.get("file_path", "")
+                            if fp:
+                                written_files.append({"ts": dt, "path": fp})
             message_turns.append({"ts": dt, "type": "assistant", "has_tool": has_tool_use})
 
         if '"interrupted":true' in line:
@@ -212,11 +245,15 @@ def parse_jsonl(path: Path):
         "last_ts": last_ts,
         "user_msgs": user_msgs,
         "interruptions": interruptions,
+        "compact_count": compact_count,
         "bash_commands": bash_commands,
         "read_files": read_files,
+        "edited_files": edited_files,
+        "written_files": written_files,
         "message_turns": message_turns,
         "tools_by_ts": tools_by_ts,
         "user_msg_ts": user_msg_ts,
+        "user_msg_texts": user_msg_texts,
     }
 
 
@@ -276,6 +313,10 @@ def daily_stats(items, target_date=None):
     all_bash = []
     all_reads = []
     all_turns = []
+    all_user_texts = []  # 当天用户消息文本
+    all_edited = []      # 当天 Edit 的文件
+    all_written = []     # 当天 Write 的文件
+    compact_count = 0    # 当天 /compact 次数
 
     for it in items:
         p = it["parsed"]
@@ -307,16 +348,27 @@ def daily_stats(items, target_date=None):
             if p["first_ts"] and p["last_ts"]:
                 dur_min += (p["last_ts"] - p["first_ts"]).total_seconds() / 60
 
-        # 只收集当天的 Bash/Read/turns
+        # 只收集当天的 Bash/Read/turns/文本/文件修改
         for bc in p["bash_commands"]:
             if target_date is None or (bc["ts"] and bc["ts"].date() == target_date):
                 all_bash.append(bc)
         for rf in p["read_files"]:
             if target_date is None or (rf["ts"] and rf["ts"].date() == target_date):
                 all_reads.append(rf)
+        for ef in p.get("edited_files", []):
+            if target_date is None or (ef["ts"] and ef["ts"].date() == target_date):
+                all_edited.append(ef)
+        for wf in p.get("written_files", []):
+            if target_date is None or (wf["ts"] and wf["ts"].date() == target_date):
+                all_written.append(wf)
+        for ut in p.get("user_msg_texts", []):
+            if target_date is None or (ut["ts"] and ut["ts"].date() == target_date):
+                all_user_texts.append(ut)
         for turn in p["message_turns"]:
             if target_date is None or (turn["ts"] and turn["ts"].date() == target_date):
                 all_turns.append(turn)
+        # compact 次数（按 session 统计，不精确到消息时间）
+        compact_count += p.get("compact_count", 0)
 
     # 计算当天最早和最晚消息时间
     all_day_ts = sorted([t["ts"] for t in all_turns if t["ts"]])
@@ -329,7 +381,11 @@ def daily_stats(items, target_date=None):
         "user_msgs": user_msgs,
         "bash_commands": all_bash,
         "read_files": all_reads,
+        "edited_files": all_edited,
+        "written_files": all_written,
+        "user_msg_texts": all_user_texts,
         "message_turns": all_turns,
+        "compact_count": compact_count,
         "earliest_ts": earliest_ts,
         "latest_ts": latest_ts,
     }
@@ -427,6 +483,122 @@ def analyze_message_patterns(turns, target_date=None):
         "assist_turns": len(assist_turns),
         "tool_runs": tool_runs,
         "max_consecutive_tools": max_consecutive_tools,
+    }
+
+
+# 用户消息中的摩擦/达成信号关键词
+FRICTION_SIGNALS = [
+    "不对", "错了", "重来", "不是", "不要", "停", "换个", "跑偏", "偏了",
+    "没理解", "误解", "搞错", "搞混", "混乱", "不对头",
+    "不要这样", "不是这样", "方向错了", "走偏", "不对劲儿",
+]
+ACHIEVEMENT_SIGNALS = [
+    "好了", "可以了", "搞定", "完成", "谢谢", "完美", "不错", "OK", "ok",
+    "解决了", "搞定了", "没问题", "成了", "满足了", "符合", "满意",
+]
+ABANDON_SIGNALS = [
+    "算了", "先这样", "明天再说", "先放着", "暂时", "以后再", "回头",
+    "搁置", "放下", "不搞了", "先不搞", "跳过",
+]
+
+
+def _safe_keyword_match(text, keyword):
+    """安全的关键词匹配：避免子串误匹配（如「成了」匹配「生成了」）"""
+    import re
+    # 要求关键词前后不是中文字母或 ASCII 字母数字（即独立成词）
+    pattern = r'(?<![一-鿿\w])' + re.escape(keyword) + r'(?![一-鿿\w])'
+    return bool(re.search(pattern, text))
+
+
+def analyze_message_content(items, target_date=None):
+    """从用户消息文本推断摩擦和达成信号（替代/补充 facet）"""
+    friction_hits = []  # [(ts, text, matched_keyword)]
+    achievement_hits = []
+    abandon_hits = []
+    short_msgs = []  # 短消息（< 20 字），连续出现说明反复修正
+
+    for it in items:
+        p = it["parsed"]
+        for ut in p.get("user_msg_texts", []):
+            if target_date and ut["ts"] and ut["ts"].date() != target_date:
+                continue
+            text = ut["text"]
+            # 摩擦信号（安全匹配）
+            for kw in FRICTION_SIGNALS:
+                if _safe_keyword_match(text, kw):
+                    friction_hits.append({"ts": ut["ts"], "text": text, "kw": kw})
+                    break
+            # 达成信号（安全匹配）
+            for kw in ACHIEVEMENT_SIGNALS:
+                if _safe_keyword_match(text, kw):
+                    achievement_hits.append({"ts": ut["ts"], "text": text, "kw": kw})
+                    break
+            # 放弃信号（安全匹配）
+            for kw in ABANDON_SIGNALS:
+                if _safe_keyword_match(text, kw):
+                    abandon_hits.append({"ts": ut["ts"], "text": text, "kw": kw})
+                    break
+            # 短消息统计
+            if len(text) < 20:
+                short_msgs.append({"ts": ut["ts"], "text": text})
+
+    # 推断结果
+    inferred = {
+        "has_friction": len(friction_hits) >= 2,
+        "friction_count": len(friction_hits),
+        "friction_examples": friction_hits[:3],
+        "has_achievement": len(achievement_hits) >= 1,
+        "achievement_count": len(achievement_hits),
+        "achievement_examples": achievement_hits[:2],
+        "has_abandon": len(abandon_hits) >= 1,
+        "abandon_count": len(abandon_hits),
+        "short_msg_count": len(short_msgs),
+        "short_msg_examples": short_msgs[:3],
+    }
+
+    # 映射到伪 facet 摩擦类型（用于统一建议）
+    if inferred["has_friction"]:
+        if inferred["short_msg_count"] >= 5:
+            inferred["top_fric_type"] = "misunderstood_request"
+            inferred["top_fric_obs"] = "用户频繁短消息纠偏，Claude 可能误解了意图"
+            inferred["top_fric_constraint"] = "开会话前用 1 句话写明目标 + 关键约束"
+        else:
+            inferred["top_fric_type"] = "user_rejected_action"
+            inferred["top_fric_obs"] = "用户多次否定 Claude 的输出"
+            inferred["top_fric_constraint"] = "要求 Claude 做重要操作前必须征得同意"
+    else:
+        inferred["top_fric_type"] = None
+
+    return inferred
+
+
+def compute_derived_metrics(stats):
+    """计算衍生指标：compact、空转、文件产出"""
+    turns = stats.get("message_turns", [])
+    edited = stats.get("edited_files", [])
+    written = stats.get("written_files", [])
+
+    # 空转：assistant 消息但没调工具（说明在纯聊天）
+    idle_turns = [t for t in turns if t["type"] == "assistant" and not t.get("has_tool")]
+
+    # 文件修改产出：去重后的文件数
+    edited_paths = {e["path"] for e in edited}
+    written_paths = {w["path"] for w in written}
+    all_modified = edited_paths | written_paths
+
+    # 反复编辑的文件（被 Edit 2+ 次的文件）
+    edit_counter = Counter(e["path"] for e in edited)
+    repeat_edits = {p: c for p, c in edit_counter.items() if c >= 2}
+
+    return {
+        "compact_count": stats.get("compact_count", 0),
+        "idle_turns": len(idle_turns),
+        "idle_pct": len(idle_turns) / max(len(turns), 1) * 100,
+        "unique_files_modified": len(all_modified),
+        "edited_files_count": len(edited),
+        "written_files_count": len(written),
+        "repeat_edits": repeat_edits,
+        "repeat_edit_count": len(repeat_edits),
     }
 
 
@@ -578,6 +750,8 @@ def gen_report_markdown(target_date, items, prev_items=None):
     bash_analysis = analyze_bash_quality(stats["bash_commands"])
     msg_patterns = analyze_message_patterns(stats["message_turns"], target_date)
     friction = extract_friction_advice(items)
+    content_analysis = analyze_message_content(items, target_date)
+    derived = compute_derived_metrics(stats)
 
     # === 概览 ===
     lines.append("## 概览")
@@ -607,14 +781,17 @@ def gen_report_markdown(target_date, items, prev_items=None):
         lines.append(f"- ...另有 {len(items) - 10} 个会话")
     lines.append("")
 
-    # === 达成与结果 ===
+    # === 达成与结果（双轨制） ===
     outcome_stats = extract_outcome_stats(items)
     lines.append("## 达成与结果")
     lines.append("")
-    if outcome_stats is None:
-        lines.append("今天没有会话评估数据（facet 未生成或不可用）。")
-        lines.append("")
-    else:
+
+    # 分离有 facet 和无 facet 的 session
+    facet_items = [it for it in items if it["facet"]]
+    no_facet_items = [it for it in items if not it["facet"]]
+
+    # 1. facet 数据（如果有）
+    if outcome_stats is not None and facet_items:
         o = outcome_stats
         parts = []
         if o["fully_achieved"]:
@@ -629,19 +806,58 @@ def gen_report_markdown(target_date, items, prev_items=None):
             parts.append(f"放弃 {o['abandoned']}")
         if o["unclear"]:
             parts.append(f"不清楚 {o['unclear']}")
-        lines.append("**结果分布**：" + (" · ".join(parts) if parts else "无数据"))
-        lines.append("")
-        lines.append(f"**达成率**：{o['achievement_rate']*100:.0f}%（完全达成 / 有评估会话）")
+        lines.append(f"**基于 /insight 评估（{o['total']} 个 session）**：")
+        lines.append("结果分布：" + (" · ".join(parts) if parts else "无数据"))
+        lines.append(f"达成率：{o['achievement_rate']*100:.0f}%")
         if o["satisfaction_rate"] is not None:
-            lines.append(f"**满意度**：{o['satisfied']}/{o['satisfied']+o['likely_satisfied']} 明确满意")
+            lines.append(f"满意度：{o['satisfied']}/{o['satisfied']+o['likely_satisfied']} 明确满意")
+        # 标注跨天警告
+        cross_day_facets = []
+        for it in facet_items:
+            p = it["parsed"]
+            if p["first_ts"] and p["last_ts"] and p["first_ts"].date() != p["last_ts"].date():
+                cross_day_facets.append(it["session_id"][:8])
+        if cross_day_facets:
+            lines.append(f"⚠️ 以下 session 跨天，facet 覆盖整个 session 不限于今天：`{'` `'.join(cross_day_facets[:5])}`")
         lines.append("")
         if o["unachieved"]:
-            lines.append("**未达成会话**：")
+            lines.append("未达成会话：")
             for sid, summary, fric in o["unachieved"]:
                 s = short(summary, 60)
                 extra = f" — {short(fric, 60)}" if fric else ""
                 lines.append(f"- `{sid}` {s}{extra}")
             lines.append("")
+
+    # 2. 消息推断数据（无 facet 的 session）
+    if no_facet_items:
+        ca = content_analysis
+        lines.append(f"**基于消息推断（{len(no_facet_items)} 个 session 无 /insight）**：")
+        inferred_parts = []
+        if ca["has_achievement"]:
+            inferred_parts.append(f"推断达成 {ca['achievement_count']}")
+        if ca["has_friction"]:
+            inferred_parts.append(f"推断有摩擦 {ca['friction_count']}")
+        if ca["has_abandon"]:
+            inferred_parts.append(f"推断放弃 {ca['abandon_count']}")
+        if not inferred_parts:
+            inferred_parts.append("信号弱，无明显摩擦或达成标记")
+        lines.append(" · ".join(inferred_parts))
+        if ca["friction_examples"]:
+            lines.append("摩擦信号：")
+            for ex in ca["friction_examples"]:
+                t = ex["ts"].strftime("%H:%M") if ex["ts"] else "??:??"
+                lines.append(f"- `{t}` 「{short(ex['text'], 50)}」→ 触发词「{ex['kw']}」")
+        if ca["achievement_examples"]:
+            lines.append("达成信号：")
+            for ex in ca["achievement_examples"]:
+                t = ex["ts"].strftime("%H:%M") if ex["ts"] else "??:??"
+                lines.append(f"- `{t}` 「{short(ex['text'], 50)}」→ 触发词「{ex['kw']}」")
+        lines.append("")
+
+    # 两者都没有
+    if not facet_items and not no_facet_items:
+        lines.append("今天没有有效会话数据。")
+        lines.append("")
 
     # === 数据快照 ===
     lines.append("## 数据快照")
@@ -669,6 +885,15 @@ def gen_report_markdown(target_date, items, prev_items=None):
         lines.append(f"| Bash 质量 | {cr}/{bash} 本可用 Read ({cr_pct:.0f}%) | {'⚠️' if cr_pct > 30 else '✅'} |")
     if msg_patterns["max_consecutive_tools"] > 5:
         lines.append(f"| 工具连发 | 最多连续 {msg_patterns['max_consecutive_tools']} 轮工具调用 | ⚠️ |")
+    # 新增衍生指标
+    if derived["compact_count"] > 0:
+        lines.append(f"| 上下文压缩 | {derived['compact_count']} 次 /compact | {'⚠️' if derived['compact_count'] >= 3 else '✅'} |")
+    if derived["idle_turns"] > 0:
+        lines.append(f"| 纯对话轮数 | {derived['idle_turns']} 轮（assistant 未调工具）| - |")
+    if derived["unique_files_modified"] > 0:
+        lines.append(f"| 文件产出 | 修改 {derived['unique_files_modified']} 个文件（Edit {derived['edited_files_count']} · Write {derived['written_files_count']}）| - |")
+    if derived["repeat_edit_count"] > 0:
+        lines.append(f"| 反复编辑 | {derived['repeat_edit_count']} 个文件被 Edit 2+ 次 | ⚠️ |")
     lines.append("")
 
     # === 对比昨天 ===
@@ -731,11 +956,28 @@ def gen_report_markdown(target_date, items, prev_items=None):
     # 6. facet 摩擦
     if friction:
         fric_summary = ", ".join(f"{k}×{v}" for k, v in list(friction["total_frics"].items())[:3])
-        problems.append(f"**会话摩擦**：{fric_summary}")
+        problems.append(f"**会话摩擦（/insight）**：{fric_summary}")
         if friction["details"]:
             sid, detail = friction["details"][0]
             problems.append(f"  - 典型例子 (`{sid}`)：{short(detail, 100)}")
-    elif not problems:
+
+    # 7. 消息推断摩擦（无 facet 时）
+    if content_analysis["has_friction"] and not friction:
+        examples = content_analysis["friction_examples"]
+        if examples:
+            t = examples[0]["ts"].strftime("%H:%M") if examples[0]["ts"] else "??:??"
+            problems.append(f"**消息推断摩擦**：用户 {content_analysis['friction_count']} 次表达否定/纠偏。例如 `{t}` 「{short(examples[0]['text'], 40)}」")
+
+    # 8. 短消息密集（反复修正信号）
+    if content_analysis["short_msg_count"] >= 5 and not friction:
+        problems.append(f"**反复短消息修正**：{content_analysis['short_msg_count']} 条短消息（<20字），说明在逐句投喂而非一次说清")
+
+    # 9. 反复编辑同一文件
+    if derived["repeat_edit_count"] > 0:
+        repeat_list = ", ".join(f"`{short(p, 30)}`×{c}" for p, c in list(derived["repeat_edits"].items())[:3])
+        problems.append(f"**反复编辑**：{repeat_list}——可能说明方案没想清楚就动手")
+
+    if not problems:
         problems.append("数据上没自动发现明显问题。今天可能用得不错，或者数据信号弱。")
 
     for p in problems:
@@ -746,11 +988,15 @@ def gen_report_markdown(target_date, items, prev_items=None):
     lines.append("## 明天的改进候选")
     lines.append("")
 
-    # 基于摩擦数据或问题检测生成精准建议
+    # 基于摩擦数据或问题检测生成精准建议（双轨）
     suggestions = []
 
+    # 优先用 facet 建议
     if friction:
         suggestions.append(f"**{friction['observation']}** —— {friction['constraint']}")
+    # 次之用消息推断建议
+    elif content_analysis["top_fric_type"]:
+        suggestions.append(f"**{content_analysis['top_fric_obs']}** —— {content_analysis['top_fric_constraint']}")
     elif bash_analysis.get("could_be_read_count", 0) >= 10 or bash_analysis.get("could_be_read_pct", 0) > 15:
         suggestions.append("**Bash 滥用** —— 下次想敲 Bash 前停 3 秒：这个命令是不是在'读文件'？是的话用 Read/Grep。")
     elif avg_msgs > HEALTHY_MSGS_PER_SESSION:
@@ -759,6 +1005,10 @@ def gen_report_markdown(target_date, items, prev_items=None):
         suggestions.append("**频繁打断** —— 想打断时先问自己：是 Claude 跑偏了，还是我没说清？")
     elif edit_write < 5 and dur_min > 60:
         suggestions.append("**落地不足** —— 开会话前先决定：今天要输出什么？不要混在探索里。")
+    elif derived["repeat_edit_count"] > 0:
+        suggestions.append("**反复编辑** —— 改前先想清楚方案，不要边写边试。")
+    elif content_analysis["short_msg_count"] >= 5:
+        suggestions.append("**短消息太多** —— 一次说清需求，不要逐句投喂。")
     else:
         suggestions.append("今天没明显坏习惯。明天保持节奏即可。")
 
@@ -766,7 +1016,7 @@ def gen_report_markdown(target_date, items, prev_items=None):
         lines.append(f"- {s}")
     lines.append("")
 
-    # === /insight 摩擦详情 ===
+    # === /insight 摩擦详情（facet 原始数据） ===
     if friction and friction["details"]:
         lines.append("## /insight 摩擦详情")
         lines.append("")
@@ -785,12 +1035,18 @@ def gen_report_markdown(target_date, items, prev_items=None):
     if friction:
         lines.append(f"- 观察：{friction['observation']}（{friction['top_type']} ×{friction['top_count']}）")
         lines.append(f"- 约束：{friction['constraint']}")
+    elif content_analysis["top_fric_type"]:
+        lines.append(f"- 观察：{content_analysis['top_fric_obs']}（消息推断）")
+        lines.append(f"- 约束：{content_analysis['top_fric_constraint']}")
     elif bash_analysis.get("could_be_read_count", 0) >= 3:
         lines.append(f"- 观察：今天 {bash_analysis['could_be_read_count']} 条 Bash 本可用 Read 替代")
         lines.append("- 约束：读文件用 Read，只有系统命令才用 Bash")
     elif avg_msgs > HEALTHY_MSGS_PER_SESSION:
         lines.append("- 观察：消息密度高，反复修正")
         lines.append("- 约束：一次说清，不要逐句投喂")
+    elif derived["repeat_edit_count"] > 0:
+        lines.append(f"- 观察：{derived['repeat_edit_count']} 个文件反复编辑")
+        lines.append("- 约束：改前先写方案，想清楚再动手")
     else:
         lines.append("- 观察：")
         lines.append("- 约束：")
