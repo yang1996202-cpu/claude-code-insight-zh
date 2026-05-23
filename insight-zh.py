@@ -226,11 +226,24 @@ def load_data(start_d, end_d):
 def load_data_from_jsonl(start_d, end_d):
     """从 ~/.claude/projects/*/*.jsonl 解析会话数据。
     返回与 load_data 兼容的 {facet, meta, date} 列表。
+    增强版：提取绘画方法论分析所需的信号（用户消息文本、/compact、主题关键词等）
     """
     items = []
     projects_dir = CLAUDE_DIR / "projects"
     if not projects_dir.exists():
         return items
+
+    # 主题关键词映射（用于识别会话涉及的主题领域）
+    TOPIC_KEYWORDS = {
+        "skill": ["skill", "技能", "/skill", "skill-manager", "stay-awake"],
+        "config": ["配置", "设置", "mcp", "claude.md", "settings", "权限"],
+        "debug": ["bug", "调试", "报错", "错误", "不行", "不对", "错了", "失败"],
+        "explore": ["怎么", "如何", "什么是", "区别", "对比", "为什么"],
+        "create": ["写一个", "做一个", "开发", "实现", "添加", "创建"],
+        "doc": ["README", "文档", "注释", "说明", "整理"],
+        "git": ["git", "commit", "push", "仓库", "开源", "license", "GPL", "MIT", "Apache"],
+        "test": ["测试", "验证", "看看", "试一下", "行不行", "你好", "你叫", "你是谁"],
+    }
 
     for jsonl_path in projects_dir.rglob("*.jsonl"):
         try:
@@ -244,6 +257,14 @@ def load_data_from_jsonl(start_d, end_d):
             cwd = ""
             version = ""
             git_branch = ""
+            # 绘画方法论新增信号
+            all_user_texts = []  # 收集所有用户消息文本
+            has_compact = False  # 是否触发 /compact
+            has_command = False  # 是否使用了 /command
+            has_url = False      # 首条是否包含 URL
+            has_image = False    # 是否包含图片
+            edit_targets = set() # Edit 修改的文件路径
+            write_targets = set() # Write 写入的文件路径
 
             with open(jsonl_path, "r", encoding="utf-8") as fp:
                 for line in fp:
@@ -268,20 +289,53 @@ def load_data_from_jsonl(start_d, end_d):
                     t = d.get("type")
                     if t == "user":
                         user_msgs += 1
-                        if not first_prompt:
-                            msg = d.get("message", {})
-                            content = msg.get("content", "")
-                            if isinstance(content, str):
-                                first_prompt = content.strip()
-                            elif isinstance(content, list) and content:
-                                first_prompt = str(content[0]).strip()
+                        msg = d.get("message", {})
+                        content = msg.get("content", "")
+                        text_content = ""
+                        if isinstance(content, str):
+                            text_content = content.strip()
+                        elif isinstance(content, list):
+                            for blk in content:
+                                if isinstance(blk, dict):
+                                    if blk.get("type") == "text":
+                                        text_content += blk.get("text", "") + " "
+                                    elif blk.get("type") == "image":
+                                        has_image = True
+                        text_content = text_content.strip()
+
+                        if text_content:
+                            all_user_texts.append(text_content)
+                            if "/compact" in text_content:
+                                has_compact = True
+                            if text_content.startswith("/") and not text_content.startswith("//"):
+                                has_command = True
+
+                        if not first_prompt and text_content:
+                            first_prompt = text_content
+                            if re.search(r'https?://', text_content):
+                                has_url = True
+
                     elif t == "assistant":
                         assist_msgs += 1
                         msg = d.get("message", {})
                         content = msg.get("content", [])
                         for c in content:
                             if c.get("type") == "tool_use":
-                                tool_counts[c.get("name", "unknown")] += 1
+                                tool_name = c.get("name", "unknown")
+                                tool_counts[tool_name] += 1
+                                # 提取 Edit/Write 的文件目标
+                                if tool_name == "Edit":
+                                    input_data = c.get("input", {})
+                                    if isinstance(input_data, dict):
+                                        fp = input_data.get("file_path", "")
+                                        if fp:
+                                            edit_targets.add(fp)
+                                elif tool_name == "Write":
+                                    input_data = c.get("input", {})
+                                    if isinstance(input_data, dict):
+                                        fp = input_data.get("file_path", "")
+                                        if fp:
+                                            write_targets.add(fp)
 
                     if not cwd:
                         cwd = d.get("cwd", "")
@@ -303,7 +357,6 @@ def load_data_from_jsonl(start_d, end_d):
             if user_msgs == 0:
                 continue
             if first_prompt.startswith("<") and ">" in first_prompt:
-                # 技能触发消息如 <command-message>...
                 continue
 
             # 计算时长（上限 12 小时，防止跨天 session 失真）
@@ -313,15 +366,103 @@ def load_data_from_jsonl(start_d, end_d):
                 if dur_min > 12 * 60:
                     dur_min = 12 * 60
 
-            # 推断会话类型
+            # ── 绘画方法论：创作阶段识别 ──
+            all_text_lower = " ".join(all_user_texts).lower()
+            # 识别主题数量（用于画布管理分析）
+            topic_hits = Counter()
+            for topic, keywords in TOPIC_KEYWORDS.items():
+                for kw in keywords:
+                    if kw.lower() in all_text_lower:
+                        topic_hits[topic] += 1
+                        break
+
+            # 创作阶段识别
+            painting_stage = "unknown"
+            bash_count = tool_counts.get("Bash", 0)
+            read_count = tool_counts.get("Read", 0)
+            edit_count = tool_counts.get("Edit", 0)
+            write_count = tool_counts.get("Write", 0)
+            total_tools = sum(tool_counts.values())
+            edit_write = edit_count + write_count
+
+            # 试笔：短会话、测试性问候、极少工具调用
+            # 注意：first_prompt.startswith("/") 是技能调用，不是试笔
+            is_greeting = "你好" in first_prompt or "你叫" in first_prompt or "你是谁" in first_prompt or "在吗" in first_prompt or "测试" in first_prompt
+            if user_msgs <= 3 and total_tools <= 1 and is_greeting:
+                painting_stage = "test_stroke"
+            # 临摹：首条是 URL、大量 Read、少量产出
+            elif has_url and read_count > edit_write * 3 and read_count > 5:
+                painting_stage = "copying"
+            # 整理：大量 Bash/Read，极少 Edit/Write，关键词匹配
+            elif bash_count > 5 and edit_write < 2 and organize_signals >= 1:
+                painting_stage = "organizing"
+            # 装裱：写 README/文档、GitHub 相关
+            elif ("README" in all_text_lower or "文档" in all_text_lower or "README" in first_prompt) and ("github" in all_text_lower or "git" in all_text_lower or "开源" in all_text_lower or "license" in all_text_lower or "发布" in all_text_lower):
+                painting_stage = "framing"
+            # 上色：大量 Edit/Write，反复修改，有文件产出
+            elif edit_write >= 3 and (len(edit_targets) + len(write_targets) >= 2 or edit_count >= 5):
+                painting_stage = "coloring"
+            # 素描：消息多、主题发散、/compact 触发
+            elif user_msgs > 50 and len(topic_hits) >= 3 and has_compact:
+                painting_stage = "sketching"
+            # 探索：消息多、工具种类杂、无明显产出
+            elif user_msgs > 20 and len([t for t, c in tool_counts.items() if c > 0]) >= 4 and edit_write < 2:
+                painting_stage = "exploring"
+            # 默认回退：根据主要工具类型判断
+            elif edit_write >= 1:
+                painting_stage = "coloring"
+            elif read_count >= 3:
+                painting_stage = "copying"
+            elif bash_count >= 3:
+                painting_stage = "exploring"
+            elif is_greeting:
+                painting_stage = "test_stroke"
+            else:
+                painting_stage = "exploring"
+
+            # ── 能量流向分类 ──
+            energy_flow = "neutral"
+            # 调试关键词列表
+            debug_keywords = ["不行", "不对", "错了", "失败", "报错", "错误", "bug", "debug", "调试", "异常", "崩溃", "卡住", "没反应"]
+            debug_signals = sum(all_text_lower.count(kw) for kw in debug_keywords)
+            # 创造关键词列表
+            create_keywords = ["做一个", "写一个", "开发", "实现", "添加", "创建", "设计", "封装", "开源", "发布", "skill", "项目"]
+            create_signals = sum(all_text_lower.count(kw) for kw in create_keywords)
+            # 学习关键词列表
+            learn_keywords = ["区别", "什么是", "为什么", "怎么", "如何", "对比", "比较", "原理", "机制", "概念", "介绍"]
+            learn_signals = sum(all_text_lower.count(kw) for kw in learn_keywords)
+            # 整理关键词列表
+            organize_keywords = ["整理", "清理", "删除", "移除", "归档", "分类", "统计", "检查", "audit", "review"]
+            organize_signals = sum(all_text_lower.count(kw) for kw in organize_keywords)
+
+            # 消耗型：调试特征（错误关键词多、会话长、反复修正）
+            if debug_signals >= 3 and user_msgs > 30:
+                energy_flow = "consuming"
+            # 创造型：有实现信号 + 有文件产出
+            elif (create_signals >= 2 or "做一个" in all_text_lower or "写一个" in all_text_lower) and edit_write >= 2:
+                energy_flow = "creating"
+            # 整理型：整理信号 + 大量 Bash/Read（少产出）
+            elif organize_signals >= 2 and bash_count > 3 and edit_write < 3:
+                energy_flow = "organizing"
+            # 学习型：学习信号 + 有 URL 或 Read 多 + 少产出
+            elif (learn_signals >= 2 or has_url) and read_count > 3 and edit_write < 3:
+                energy_flow = "learning"
+            # 兜底：有文件产出但没明显创造信号的，归为创造型
+            elif edit_write >= 5:
+                energy_flow = "creating"
+            # 大量 Read 但没产出的，归为学习型
+            elif read_count > 5 and edit_write == 0:
+                energy_flow = "learning"
+
+            # 推断会话类型（保留旧逻辑兼容）
             session_type = "single_task"
             if user_msgs > 30:
                 session_type = "multi_task"
             elif user_msgs < 5 and assist_msgs < 10:
                 session_type = "quick_question"
-            elif tool_counts.get("Bash", 0) > 20 or tool_counts.get("Read", 0) > 15:
+            elif bash_count > 20 or read_count > 15:
                 session_type = "exploration"
-            elif any(t in tool_counts for t in ["Edit", "Write"]):
+            elif edit_write > 0:
                 session_type = "iterative_refinement"
 
             # 推断目标（从第一条用户消息）
@@ -341,6 +482,14 @@ def load_data_from_jsonl(start_d, end_d):
                 "goal_categories": {},
                 "user_satisfaction_counts": {},
                 "_source": "jsonl",
+                # 绘画方法论新增字段
+                "painting_stage": painting_stage,
+                "energy_flow": energy_flow,
+                "topic_count": len(topic_hits),
+                "has_compact": has_compact,
+                "has_url": has_url,
+                "edit_targets_count": len(edit_targets),
+                "write_targets_count": len(write_targets),
             }
 
             # 构造 meta
@@ -366,6 +515,9 @@ def load_data_from_jsonl(start_d, end_d):
                 "uses_mcp": False,
                 "version": version,
                 "git_branch": git_branch,
+                # 绘画方法论新增
+                "all_user_texts": all_user_texts,
+                "topic_hits": dict(topic_hits),
             }
 
             items.append({"facet": facet, "meta": meta, "date": dt})
@@ -535,102 +687,194 @@ def collect_texts_to_translate(items):
 
 # ── 定性分析 ──
 
-def generate_qualitative_analysis(items, total, total_dur, total_user_msgs, total_commits, frictions, interruptions, hours, goals):
-    """基于规则推断工作模式和坏习惯，生成定性分析段落。"""
+# ── 绘画方法论分析 ──
+
+STAGE_LABELS = {
+    "test_stroke": "试笔",
+    "copying": "临摹",
+    "sketching": "素描",
+    "exploring": "探索",
+    "coloring": "上色",
+    "framing": "装裱",
+    "organizing": "整理",
+    "unknown": "未分类",
+}
+
+STAGE_DESCRIPTIONS = {
+    "test_stroke": "验证工具是否正常，不产出作品",
+    "copying": "学习他人作品，Read 多产出少",
+    "sketching": "一张画布尝试多种构图，主题发散",
+    "exploring": "自由探索，工具杂但无明确产出",
+    "coloring": "专注实现，大量 Edit/Write",
+    "framing": "文档、README、GitHub 发布准备",
+    "organizing": "整理画室，系统审计与清理",
+    "unknown": "无法归类",
+}
+
+ENERGY_LABELS = {
+    "consuming": "消耗型",
+    "creating": "创造型",
+    "learning": "学习型",
+    "organizing": "整理型",
+    "neutral": "中性",
+}
+
+ENERGY_DESCRIPTIONS = {
+    "consuming": "陷入调试地狱，连环 bug 反复修",
+    "creating": "从需求到产出的完整链路",
+    "learning": "知识探索、对比、文档阅读",
+    "organizing": "系统审计、配置、清理",
+    "neutral": "无明显能量特征",
+}
+
+
+def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_commits, hours, goals):
+    """基于《黑客与画家》方法论的画室观察笔记。
+
+    Paul Graham 的核心观点：
+    1. 黑客和画家都是创作者——作品是"改"出来的，不是一次画对的
+    2. 快速原型——先画一个粗糙版本，再不断迭代
+    3. 大段连续时间——创作需要不被打断的沉浸
+    4. 草图和成品一样珍贵——保存所有中间状态
+    5. 完成比完美重要——必须设定"展览日"
+    6. 自下而上——在过程中发现，不是严格按计划
+
+    报告像画室导师的观察笔记，不是统计数据报表。
+    """
     lines = []
     n = len(items)
     bash = total.get("Bash", 0)
     read = total.get("Read", 0)
     edit = total.get("Edit", 0)
     write = total.get("Write", 0)
+    edit_write = edit + write
 
-    lines.append("## 你的工作模式画像")
+    # ── 收集基础数据 ──
+    compact_count = 0
+    topic_counts = []
+    long_sessions = 0
+    short_sessions = 0
+    evening_sessions = 0
+    morning_sessions = 0
+
+    for it in items:
+        f = it["facet"]
+        m = it["meta"]
+        if f.get("has_compact"):
+            compact_count += 1
+        topic_counts.append(f.get("topic_count", 0))
+        umsgs = m.get("user_message_count", 0)
+        if umsgs > 100:
+            long_sessions += 1
+        elif umsgs < 10:
+            short_sessions += 1
+        # 时段
+        h = it.get("hour", 12)
+        if 18 <= h <= 23:
+            evening_sessions += 1
+        elif 6 <= h <= 11:
+            morning_sessions += 1
+
+    avg_topics = sum(topic_counts) / max(len(topic_counts), 1)
+    avg_msg_per_session = total_user_msgs / max(n, 1)
+
+    lines.append("## 画室观察笔记")
+    lines.append("")
+    lines.append(f"这周你的画室里有 {n} 张画布，总共落了 {total_user_msgs} 笔。")
     lines.append("")
 
-    # 1. 基础设施型工作者
-    infra_heavy = sum(v for k, v in goals.items() if k in ["调试与排障", "配置与安装", "Skill 系统管理", "MCP 相关"])
-    content_heavy = sum(v for k, v in goals.items() if k in ["内容创作", "代码与实现"])
-    if infra_heavy > content_heavy * 1.5:
-        hours_spent = total_dur // 60
-        lines.append(f"你是**基础设施型工作者**。你的主要精力花在调试 MCP、配置代理、管理 skill 系统这些「修工具」的事情上，而不是「用工具做事」。你花的 {hours_spent} 小时里，真正落到代码/内容产出的比例偏低。")
-    elif content_heavy > infra_heavy:
-        lines.append("你是**产出型工作者**。你的时间主要花在内容创作和代码实现上，工具配置占比不高。")
+    # ── 观察 1：速写太多，油画太少 ──
+    lines.append("### 观察一：你画了很多速写，但没有一幅发展成油画")
+    lines.append("")
+    lines.append(f"{short_sessions} 张画布只画了几笔就搁下了（少于 10 条消息），占总数的 {short_sessions/max(n,1)*100:.0f}%。")
+    if long_sessions > 0:
+        lines.append(f"只有 {long_sessions} 张画布画了超过 100 笔，算是大幅油画。")
     else:
-        lines.append("你是**混合型工作者**。基础设施和内容产出各占一定比例，没有明显偏重。")
+        lines.append("没有一张画布画了超过 100 笔——你本周没有画过任何大幅油画。")
     lines.append("")
-
-    # 2. 交互风格
-    ratio = bash / read if read > 0 else (999 if bash > 0 else 0)
-    if ratio > 3:
-        lines.append(f"你的交互风格是**「Bash 探索型」**。你倾向于让 Claude 用 shell 命令一步步探索，而不是直接读取文件定位问题。这种风格适合未知领域的摸索，但代价是上下文膨胀和效率损失。{bash} 次 Bash 调用 vs {read} 次 Read，这个比例说明你还没养成「先读再动」的习惯。")
-    elif ratio > 1.5:
-        lines.append(f"你的交互风格偏向**「混合探索型」**。Bash 和 Read 的使用比例 {ratio:.1f}:1，略高于理想基线 2:1。你在探索直接读文件之间摇摆。")
+    lines.append("Paul Graham 在《黑客与画家》里说，黑客的工作方式是**先写出一个粗糙版本，再不断修改**。画家也一样——先随便画几笔建立画面关系，再逐步深入。速写是探索，但如果没有一幅发展成油画，探索就永远只是探索。")
+    lines.append("")
+    lines.append("你这周的状态像是：站在画室中央，周围摊着 26 张只画了几笔的纸，每张纸上都有一个开始但没有结束的想法。画家不会这样工作——他们会选一张速写，把它钉在画架上，画完它。")
+    lines.append("")
+    if long_sessions == 0:
+        lines.append("**明天可以试的**：打开 Claude Code 后，不要问'这个怎么做'，直接说'我要写一个做 X 的脚本'，然后写到它能跑。哪怕只有 20 行，也要让它跑起来。")
     else:
-        lines.append("你的交互风格是**「精准定位型」**。Bash/Read 比例健康，说明你已经养成了先读文件再动手的好习惯。")
+        lines.append("**明天可以试的**：选一张你最感兴趣的速写（某次短会话），把它钉在画架上画完。规则：这次会话必须产生一个可运行的文件。")
     lines.append("")
 
-    # 3. 提示风格
-    avg_msgs = total_user_msgs / max(n, 1)
-    if avg_msgs > 40:
-        fric_mis = frictions.get("misunderstood_request", 0)
-        fric_wrong = frictions.get("wrong_approach", 0)
-        lines.append(f"你的提示风格是**「短促迭代型」**。平均每会话 {avg_msgs:.0f} 条消息，说明你习惯扔简短指令然后快速修正，而不是 upfront 写清楚需求。这种模式快但不稳，{fric_mis} 次「误读请求」和 {fric_wrong} 次「方向错误」都跟这个习惯直接相关。")
-    elif avg_msgs > 15:
-        lines.append(f"你的提示风格是**「中等迭代型」**。平均每会话 {avg_msgs:.0f} 条消息，有来回修正但不算极端。")
+    # ── 观察 2：调色时间远超画画时间 ──
+    lines.append("### 观察二：你把大部分时间花在调色盘上，不在画布上")
+    lines.append("")
+    bash_read_ratio = bash / max(read, 1)
+    lines.append(f"你这周调了 {bash} 次颜料（Bash），在画布上落了 {edit_write} 笔（Edit/Write）。Bash/Read 比是 {bash_read_ratio:.1f}，这意味着你每读一个文件，就执行了 {bash_read_ratio:.1f} 个命令。")
+    lines.append("")
+    lines.append("画家当然需要调颜料。但如果调色时间超过画画时间，说明两种可能：一是还没想好画什么（准备过度），二是害怕在画布上落笔（交付恐惧）。")
+    lines.append("")
+    lines.append("Paul Graham 说，**编程和画画一样，是设计工作**。设计不是在脑子里想清楚的，是在画布上试出来的。你现在的模式是'想清楚了再画'，但画家不会这样——画家会在画布上直接试，错了就覆盖，对了就保留。")
+    lines.append("")
+    lines.append("**明天可以试的**：打开 Claude Code 的第一件事不是跑 `ls` 或 `cat`，而是直接 `Write` 一个文件。哪怕里面只有 3 行伪代码，先把它写下来。写完了再读相关文件来修改，而不是先读再写。")
+    lines.append("")
+
+    # ── 观察 3：不保存草图 ──
+    lines.append("### 观察三：你不保存草图")
+    lines.append("")
+    if total_commits == 0:
+        lines.append(f"你这周画了 {n} 张画，{edit_write} 笔落在画布上，但**一张草图都没保存**（0 commit）。")
     else:
-        lines.append(f"你的提示风格是**「精准表达型」**。平均每会话 {avg_msgs:.0f} 条消息，需求传达比较清晰。")
+        lines.append(f"你这周画了 {n} 张画，但只保存了 {total_commits} 次草图。")
+    lines.append("")
+    lines.append("画家的草图本是最宝贵的资产。Paul Graham 说，**好的设计来自不断修改**。但你连第一版都没保存，怎么修改？没有 git 历史，你就无法回溯、无法对比、无法学习。")
+    lines.append("")
+    lines.append("想象一下：梵高画《星空》时，如果每画一层就把底层完全刮掉，我们今天只能看到最后一版，看不到他是如何从草稿演变成杰作的。你的 git 历史就是草图本——它记录了你思路的演进。")
+    lines.append("")
+    lines.append("**明天可以试的**：每次 Edit 或 Write 后，立刻跑 `git add . && git commit -m 'wip: 做了什么'`。不要等'画完'，草图也要存。commit message 可以写得很随便，'试了 XX 不行'、'加了 YY 功能'都可以。重要的是保存状态。")
     lines.append("")
 
-    # 4. 时间模式
-    night = sum(hours.get(h, 0) for h in range(18, 24))
-    midnight = sum(hours.get(h, 0) for h in range(0, 6))
-    morning = sum(hours.get(h, 0) for h in range(6, 12))
-    if night + midnight > n * 0.6:
-        pct = (night + midnight) / max(n, 1) * 100
-        lines.append(f"你的时间模式是**「夜猫子型」**。{night} 个会话在晚上，{midnight} 个在凌晨，合计占 {pct:.0f}%。深夜工作注意力集中但认知资源有限，可能是「方向错误」和「过度修改」的高发时段。")
-    elif morning > n * 0.4:
-        lines.append(f"你的时间模式是**「晨型」**。上午会话占比高，这个时段认知状态最好。")
+    # ── 观察 4：深夜画画，但深夜没有自然光 ──
+    lines.append("### 观察四：你在深夜画画，但深夜没有自然光")
+    lines.append("")
+    if morning_sessions == 0:
+        lines.append("你这周上午一次都没进过画室，晚上和凌晨却来了很多次。")
     else:
-        lines.append(f"你的时间模式比较分散，没有明显的时段偏好。")
+        lines.append(f"你这周上午来了 {morning_sessions} 次，晚上和凌晨来了 {evening_sessions} 次。")
+    lines.append("")
+    lines.append("Paul Graham 说黑客需要**大段不被打断的时间**。但深夜不是'不被打断'，是'逃避白天的压力'。白天你不敢认真画，因为怕画不好被人看见；深夜画画是焦虑驱动的，不是创作驱动的。")
+    lines.append("")
+    lines.append("画家需要自然光。凌晨的画室里，你看不清颜色的真实关系，只是在凭感觉涂抹。上午的阳光最稳定，最适合做重要的决定——比如'这幅画要不要继续画下去'。")
+    lines.append("")
+    lines.append("**明天可以试的**：把最难的问题留在上午 9-11 点。打开 Claude Code 前，先拿一张纸（真的纸）写下'今天要画什么'。如果上午画不好，说明问题还没想清，去散步，不要硬画。")
     lines.append("")
 
-    # 5. 坏习惯 Top 3
-    lines.append("## 坏习惯 Top 3")
-    lines.append("")
-    habits = []
-    if frictions.get("misunderstood_request", 0) >= 5:
-        habits.append(("提示过短", frictions["misunderstood_request"], "你扔的 prompt 太短，Claude 只能猜。下次多写一句背景或约束。"))
-    if frictions.get("wrong_approach", 0) >= 5:
-        habits.append(("方向把控弱", frictions["wrong_approach"], "Claude 跑偏了你才发现。开头就声明「快诊还是深挖」，或要求「先给方案不动手」。"))
-    if bash > 0 and read > 0 and bash / read > 2:
-        habits.append(("Bash 依赖", int(bash/read), "能用 Read/Grep 的事你让 Claude 跑 Bash。上下文膨胀的元凶。"))
-    if interruptions > 5:
-        habits.append(("频繁打断", interruptions, "你中途打断 Claude 的次数很多。打断前先问自己：是 Claude 跑偏了，还是我没说清？"))
-    if total_commits == 0 and total_dur > 600:
-        hours_spent = total_dur // 60
-        habits.append(("只探索不落地", hours_spent, f"{hours_spent} 小时里没有 commit。你在修工具，不在做产品。"))
-    elif total_commits < 5 and total_dur > 1200:
-        hours_spent = total_dur // 60
-        habits.append(("产出过低", total_commits, f"{hours_spent} 小时只有 {total_commits} 个 commit。调试时间占比太高。"))
-    if total_user_msgs > n * 50:
-        habits.append(("消息密度过高", int(avg_msgs), "每会话消息太多，说明你在用注意力补 prompt 的不足。"))
+    # ── 观察 5：画布被覆盖了 ──
+    if compact_count > 0 or long_sessions > 0:
+        lines.append("### 观察五：你的画布被覆盖了")
+        lines.append("")
+        if compact_count > 0:
+            lines.append(f"你有 {compact_count} 次画到一半，画布满了（触发 /compact），早期的构图被后期的覆盖。")
+        if long_sessions > 0:
+            lines.append(f"还有 {long_sessions} 张大幅油画，画了 100 多笔，但可能也在不断覆盖之前的内容。")
+        lines.append("")
+        lines.append("画家一层层叠加颜料，但不会把底层完全盖住——底层的颜色会透出来，给画面增加深度。/compact 就像把底层的颜料刮掉，只保留最上面一层。你早期的想法、失败的尝试、临时的灵感，都被覆盖了。")
+        lines.append("")
+        lines.append("Paul Graham 说，**编程是逐步细化的过程**。第一版是粗的轮廓，第二版加了颜色，第三版调整了比例。但如果每一版都覆盖了上一版，你就看不到自己是怎么从 A 走到 B 的。")
+        lines.append("")
+        lines.append("**明天可以试的**：当一张画布超过 50 条消息时，问自己是不是在画两幅不同的画。如果是，开一张新画布。不要把所有想法挤在一幅画上——画家不会在同一张画布上同时画肖像和风景。")
+        lines.append("")
 
-    habits.sort(key=lambda x: x[1], reverse=True)
-    for i, (name, count, desc) in enumerate(habits[:3], 1):
-        lines.append(f"{i}. **{name}**（信号强度：{count}）— {desc}")
-    lines.append("")
-
-    # 6. 与平均用户的对比
-    lines.append("## 与平均用户的对比")
-    lines.append("")
-    lines.append(f"- 你的 Bash/Read 比是 {bash/max(read,1):.1f}:1，健康基线是 2:1。{'高于' if bash/max(read,1) > 2 else '符合'}基线。")
-    lines.append(f"- 你的平均每会话时长是 {total_dur//max(n,1)} 分钟，{'偏长' if total_dur//max(n,1) > 120 else '正常'}（说明单次工作块深度大）。")
-    lines.append(f"- 你的平均每会话消息数是 {total_user_msgs//max(n,1)} 条，{'偏高' if avg_msgs > 30 else '正常'}。")
-    lines.append(f"- 你的 commit 率：{total_dur//max(total_commits,1) if total_commits else '∞'} 分钟/commit（理想 < 120 分钟/commit）。")
-    lines.append("")
+    # ── 观察 6：完成比完美重要 ──
+    if total_commits == 0 and n > 5:
+        lines.append("### 观察六：你没有展览日")
+        lines.append("")
+        lines.append(f"这周 {n} 张画，{total_user_msgs} 笔，{total_dur} 分钟——但没有一张画被装裱（commit）或展览（push）。")
+        lines.append("")
+        lines.append("Paul Graham 说，**发布早期版本**是黑客的重要习惯。画家也一样——如果一幅画永远在画室里还没画完，它就永远不存在。展览日期逼着你完成：线条不够完美？没关系。颜色不够准确？先挂上再说。")
+        lines.append("")
+        lines.append("你现在的问题是完美主义瘫痪——每张画都还没准备好。但画家的秘密是：没有一幅画是真正完成的，只是在某个时刻被从画室拿走了。")
+        lines.append("")
+        lines.append('**明天可以试的**：选一个今天写的文件，不管完成度多少，跑 `git init && git add . && git commit -m "first stroke" && git push`。不要想这个能给别人看吗，先推出去。推出去的画才是真实的画，留在画室里的只是想象。')
+        lines.append("")
 
     return lines
-
 
 def generate_report(items, translations=None):
     if not items:
@@ -748,8 +992,8 @@ def generate_report(items, translations=None):
                 lines.append(f"- {start_gap} → {end_gap}（空白 {gap_days} 天）")
             lines.append("")
 
-    # ── 定性分析 ──
-    lines.extend(generate_qualitative_analysis(items, total, total_dur, total_user_msgs, total_commits, frictions, interruptions, hours, goals))
+    # ── 绘画方法论分析 ──
+    lines.extend(generate_painting_analysis(items, total, total_dur, total_user_msgs, total_commits, hours, goals))
 
     # ── 你在做什么 ──
     lines.append("## 你在做什么")
@@ -890,50 +1134,7 @@ def generate_report(items, translations=None):
         lines.append(f"**用户打断 Claude 共 {interruptions} 次。**")
         lines.append("")
 
-    # ── 改进建议 ──
-    lines.append("## 改进建议")
-    lines.append("")
-    suggestions = []
-    top_friction = frictions.most_common(1)
-    if top_friction:
-        name, count = top_friction[0]
-        label = FRICTION_MAP.get(name, name)
-        if name == "misunderstood_request":
-            suggestions.append(f"**减少「{label}」（{count} 次）**：提示太短。下次在 prompt 开头加一句 scope 描述，比如「我只是想重命名路径，不要做诊断」。")
-        elif name == "wrong_approach":
-            suggestions.append(f"**减少「{label}」（{count} 次）**：Claude 走了你不想要的方向。开会话第一句就给出「快诊还是深挖」的约束，或明确说「先给方案不动手」。")
-        elif name == "buggy_code":
-            suggestions.append(f"**减少「{label}」（{count} 次）**：每次 Claude 写代码后，先 review 再让它跑。或要求「先写测试再写实现」。")
-        elif name == "excessive_changes":
-            suggestions.append(f"**减少「{label}」（{count} 次）**：Claude 改太多了。加一句「只做最小改动，改之前给我看计划」。")
-        elif name == "user_rejected_action":
-            suggestions.append(f"**减少「{label}」（{count} 次）**：Claude 做了你没授权的事。CLAUDE.md 里加一条「做任何 Write/Edit 前先汇报」。")
-        else:
-            suggestions.append(f"**减少「{label}」（{count} 次）**：这是你最频繁的摩擦点，下次主动加一个约束来预防。")
-
-    bash_count = total.get("Bash", 0)
-    read_count = total.get("Read", 0)
-    if read_count > 0 and bash_count / read_count > 2.0:
-        suggestions.append(f"**Bash 滥用**：Bash {bash_count} 次 vs Read {read_count} 次，比例 {bash_count/read_count:.1f}。下次要求 Claude「诊断前用 Read/Grep，Bash 最多 3 次」。")
-    elif bash_count > 50 and read_count == 0:
-        suggestions.append(f"**Bash 滥用**：用了 {bash_count} 次 Bash 但没用 Read。要求 Claude 优先用 Read/Grep 工具。")
-
-    avg_msgs = total_user_msgs / max(n, 1)
-    if avg_msgs > 50:
-        suggestions.append(f"**消息密度高**：平均每会话 {avg_msgs:.0f} 条消息。试试先写 3 行需求再发，减少来回修正。")
-
-    edit_count = total.get("Edit", 0)
-    write_count = total.get("Write", 0)
-    edit_write = edit_count + write_count
-    if edit_write < 5 and total_dur > 600 and n > 0:
-        suggestions.append(f"**只探索没落地**：{total_dur} 分钟但 Edit/Write 只有 {edit_write} 次。今天主要在调试/搜索/聊天，不在落地实现。")
-
-    if not suggestions:
-        suggestions.append("今天没明显坏习惯。保持当前节奏即可。")
-
-    for s in suggestions:
-        lines.append(f"- {s}")
-    lines.append("")
+    # ── 观察与建议已整合进「画室观察笔记」，此处不再重复 ──
 
     # ── 会话摘要精选 ──
     if brief_summaries:
@@ -1348,16 +1549,28 @@ def generate_coaching_advice(stats_dict, translations=None, force_regenerate=Fal
 直接、有洞察、不说教，从数据里看出行为模式背后的认知陷阱。
 
 下面是用户使用 Claude Code（AI 编程工具）的全部行为数据。
-他自评「用得不够好」，想真正进步。请基于这些数据，给出 **5 条**深度建议。
+他自评「用得不够好」，想真正进步。请基于这些数据，给出 **3 条**深度建议。
+
+**重要：不要重复以下已分析过的内容：**
+- Bash/Read 比过高、工具使用模式（已在「画室观察笔记」中分析）
+- 0 commit、不保存草图（已在「画室观察笔记」中分析）
+- 时段分布、上午缺失（已在「画室观察笔记」中分析）
+- /compact、画布覆盖（已在「画室观察笔记」中分析）
+- 完成度、完美主义（已在「画室观察笔记」中分析）
+
+**请聚焦以下维度，给出补充性洞察：**
+1. 注意力管理：多任务切换、打断模式、深度工作窗口
+2. 长期目标对齐：当前行为与声称目标的差距、战略漂移
+3. 心智模式：对 AI 的信任度、控制欲、学习 vs 执行的偏好
+4. 社交/协作维度：是否孤立工作、是否分享成果、反馈循环
 
 **严格要求：**
 1. 每条建议必须**引用具体证据**（数字、日期、案例），不能是空话
 2. 给出**根因分析**：为什么会这样？背后的认知/习惯/工作模式问题是什么？
 3. 提出**可执行的行动**：不要空泛的「多用 Read」，而是「下周一开始，每次开会话前先 ...」
-4. 维度要**多样**：不只是工具使用，包括时间管理、注意力、产出节奏、心智模式、长期目标
-5. 语气**直接、不奉承、不批判**，像 Karpathy 一样客观陈述事实
-6. 中文**自然流畅**，不要翻译腔，不要"赋能""核心能力"这种空词
-7. 每条建议大约 150-200 字
+4. 语气**直接、不奉承、不批判**，像 Karpathy 一样客观陈述事实
+5. 中文**自然流畅**，不要翻译腔，不要"赋能""核心能力"这种空词
+6. 每条建议大约 150-200 字
 
 **输出格式**（严格遵守，每条建议之间用 `---` 分隔）：
 
@@ -1375,7 +1588,7 @@ def generate_coaching_advice(stats_dict, translations=None, force_regenerate=Fal
 
 {evidence_text}
 
-开始给出 5 条建议（每条都要有完整的标题/证据/根因/行动结构）："""
+开始给出 3 条建议（每条都要有完整的标题/证据/根因/行动结构）："""
 
     try:
         from anthropic import Anthropic
@@ -1454,6 +1667,37 @@ def generate_coaching_advice(stats_dict, translations=None, force_regenerate=Fal
     except Exception as e:
         print(f"  (LLM 建议生成失败: {e})", file=sys.stderr)
         return []
+
+
+
+def _md_lines_to_html(md_lines):
+    """将 markdown 行列表转为简单 HTML。"""
+    html_parts = []
+    for line in md_lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("## "):
+            html_parts.append(f"<h2>{line[3:]}</h2>")
+        elif line.startswith("### "):
+            html_parts.append(f"<h3>{line[4:]}</h3>")
+        elif line.startswith("- "):
+            text = line[2:]
+            text = _md_bold(text)
+            html_parts.append(f"<li>{text}</li>")
+        elif line.startswith("**明天可以试的**"):
+            text = _md_bold(line)
+            html_parts.append(f'<div style="margin:12px 0;padding:12px 16px;background:#f0fdf4;border-left:3px solid #22c55e;border-radius:4px;">{text}</div>')
+        else:
+            text = _md_bold(line)
+            html_parts.append(f"<p>{text}</p>")
+    return "\n".join(html_parts)
+
+
+def _md_bold(text):
+    """替换 **text** 为 <strong>。"""
+    import re
+    return re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
 
 
 def generate_html_report(items, translations=None, force_regenerate_advice=False):
@@ -1562,6 +1806,25 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         if bs:
             brief_summaries.append((it["date"], translations.get(bs, bs)))
         interruptions += m.get("user_interruptions", 0)
+
+    # ── 绘画方法论分析 ──
+    hours = Counter()
+    for it in items:
+        st = it["meta"].get("start_time", "")
+        if st:
+            try:
+                h = datetime.fromisoformat(st.replace("Z", "+00:00")).astimezone().hour
+                hours[h] += 1
+            except Exception:
+                pass
+    total_tools = tool_counter
+    painting_md = generate_painting_analysis(items, total_tools, total_dur, total_user_msgs, total_commits, hours, goals)
+    painting_html_content = _md_lines_to_html(painting_md)
+    painting_section_html = f'''<div class="section" id="painting">
+  <h2>画室观察笔记</h2>
+  <p style="color:var(--text-dim);margin-bottom:20px;font-size:0.95rem;">基于 Paul Graham《黑客与画家》的方法论，把你的 Claude Code 使用比作画家在画室创作。</p>
+  {painting_html_content}
+</div>'''
 
     # ── 新增：按日期分布数据（用于时间分布图）──
     date_distribution = {}  # date -> {"count": 0, "dur": 0, "msgs": 0}
@@ -3026,7 +3289,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     {"<div class='gap-alert'>" + "".join(f"<div>⚠️ {s} → {e}（空白 {d} 天）</div>" for s, e, d in sorted(gaps, key=lambda x: x[2], reverse=True)[:3]) + "</div>" if gaps else ""}
   </div>
 
-  <!-- 反常信号 -->
+  {painting_section_html}\n\n  <!-- 反常信号 -->
   <div class="section" id="anomalies">
     <h2>⚡ 自动发现的反常信号</h2>
     <p class="section-hint">从交叉分析中自动找出的「跟均值差异显著」的信号 — 🔴 红色 = 问题，🟡 黄色 = 警示，🟢 绿色 = 优势。每条带数据 + 含义 + 相关会话。</p>
