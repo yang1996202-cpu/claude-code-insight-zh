@@ -819,9 +819,9 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
     lines.append("### 观察三：你不保存草图")
     lines.append("")
     if total_commits == 0:
-        lines.append(f"你这周画了 {n} 张画，{edit_write} 笔落在画布上，但**一张草图都没保存**（0 commit）。")
+        lines.append(f"你这周画了 {n} 张画，{edit_write} 笔落在画布上，但**一张都没推出去展览**（0 push）。")
     else:
-        lines.append(f"你这周画了 {n} 张画，但只保存了 {total_commits} 次草图。")
+        lines.append(f"你这周画了 {n} 张画，推出去展览了 {total_commits} 次。")
     lines.append("")
     lines.append("画家的草图本是最宝贵的资产。Paul Graham 说，**好的设计来自不断修改**。但你连第一版都没保存，怎么修改？没有 git 历史，你就无法回溯、无法对比、无法学习。")
     lines.append("")
@@ -865,7 +865,7 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
     if total_commits == 0 and n > 5:
         lines.append("### 观察六：你没有展览日")
         lines.append("")
-        lines.append(f"这周 {n} 张画，{total_user_msgs} 笔，{total_dur} 分钟——但没有一张画被装裱（commit）或展览（push）。")
+        lines.append(f"这周 {n} 张画，{total_user_msgs} 笔，{total_dur} 分钟——但没有一张画被拿出去展览（push）。")
         lines.append("")
         lines.append("Paul Graham 说，**发布早期版本**是黑客的重要习惯。画家也一样——如果一幅画永远在画室里还没画完，它就永远不存在。展览日期逼着你完成：线条不够完美？没关系。颜色不够准确？先挂上再说。")
         lines.append("")
@@ -913,7 +913,7 @@ def generate_report(items, translations=None):
         total_user_msgs += m.get("user_message_count", 0)
         total_assist_msgs += m.get("assistant_message_count", 0)
         total_dur += m.get("duration_minutes", 0)
-        total_commits += m.get("git_commits", 0)
+        total_commits += m.get("git_pushes", 0)
         total_input_tokens += m.get("input_tokens", 0)
         total_output_tokens += m.get("output_tokens", 0)
         for k, v in m.get("tool_counts", {}).items():
@@ -953,7 +953,7 @@ def generate_report(items, translations=None):
     lines = []
     lines.append(f"# Claude Code 中文洞察报告")
     lines.append(f"")
-    lines.append(f"**{n} 个会话 · {first_date} 至 {last_date} · {total_user_msgs} 条用户消息 · {total_dur} 分钟 · {total_commits} 个 commit**")
+    lines.append(f"**{n} 个会话 · {first_date} 至 {last_date} · {total_user_msgs} 条用户消息 · {total_dur} 分钟 · {total_commits} 次 push**")
     lines.append(f"")
     has_jsonl = any(it.get("facet", {}).get("_source") == "jsonl" for it in items)
     if has_jsonl:
@@ -971,7 +971,7 @@ def generate_report(items, translations=None):
     lines.append(f"| 用户消息 | {total_user_msgs} |")
     lines.append(f"| Claude 回复 | {total_assist_msgs} |")
     lines.append(f"| 总时长 | {total_dur} 分钟（约 {total_dur // 60} 小时） |")
-    lines.append(f"| Git commit | {total_commits} |")
+    lines.append(f"| Git push | {total_commits} |")
     lines.append(f"| Input tokens | {total_input_tokens:,} |")
     lines.append(f"| Output tokens | {total_output_tokens:,} |")
     lines.append(f"| 平均每个会话 | {total_dur // max(n, 1)} 分钟 · {total_user_msgs // max(n, 1)} 消息 |")
@@ -1353,7 +1353,7 @@ def detect_anomalies(items, translations=None):
             cat_samples = [_sample(s) for s in sess if cat in s["big_cats"]][:8]
             add_anomaly(
                 "red", "投入产出比",
-                f"「{cat}」{cd['total']} 个会话，0 个 commit",
+                f"「{cat}」{cd['total']} 个会话，0 次 push",
                 f"这个方向你投入了 {cd['total']} 个会话，但没有任何代码 commit 落地。",
                 f"这是典型的'修工具'模式 —— 你花时间维护基础设施，但没产生可交付的产品。"
                 f"问问自己：这些时间换来了什么？知识？还是只是消耗？",
@@ -1514,7 +1514,7 @@ def generate_coaching_advice(stats_dict, translations=None, force_regenerate=Fal
     # 构造证据材料
     s = stats_dict
     evidence_lines = []
-    evidence_lines.append(f"总览：{s['n']} 个会话，{s['total_dur']} 分钟（约 {s['total_dur']//60} 小时），{s['total_user_msgs']} 条消息，{s['total_commits']} 个 commit")
+    evidence_lines.append(f"总览：{s['n']} 个会话，{s['total_dur']} 分钟（约 {s['total_dur']//60} 小时），{s['total_user_msgs']} 条消息，{s['total_commits']} 次 push")
     evidence_lines.append(f"时间分布：凌晨 {s['midnight']}、上午 {s['morning']}、下午 {s['afternoon']}、晚上 {s['night']}")
     evidence_lines.append(f"工具使用：Bash {s['bash']} · Read {s['read']} · Edit {s['edit']} · Write {s['write']}（Bash/Read 比 {s['bash']/max(s['read'],1):.1f}）")
     evidence_lines.append(f"用户打断 Claude 共 {s['interruptions']} 次")
@@ -1553,7 +1553,7 @@ def generate_coaching_advice(stats_dict, translations=None, force_regenerate=Fal
 
 **重要：不要重复以下已分析过的内容：**
 - Bash/Read 比过高、工具使用模式（已在「画室观察笔记」中分析）
-- 0 commit、不保存草图（已在「画室观察笔记」中分析）
+- 0 push、不保存草图（已在「画室观察笔记」中分析）
 - 时段分布、上午缺失（已在「画室观察笔记」中分析）
 - /compact、画布覆盖（已在「画室观察笔记」中分析）
 - 完成度、完美主义（已在「画室观察笔记」中分析）
@@ -1745,7 +1745,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         total_user_msgs += m.get("user_message_count", 0)
         total_assist_msgs += m.get("assistant_message_count", 0)
         total_dur += m.get("duration_minutes", 0)
-        total_commits += m.get("git_commits", 0)
+        total_commits += m.get("git_pushes", 0)
         total_input_tokens += m.get("input_tokens", 0)
         total_output_tokens += m.get("output_tokens", 0)
         for k, v in m.get("tool_counts", {}).items():
@@ -1933,7 +1933,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     if total_commits == 0 and total_dur > 600:
         habits.append(("只探索不落地", total_dur // 60, "小时里没有 commit。你在修工具，不在做产品。"))
     elif total_commits < 5 and total_dur > 1200:
-        habits.append(("产出过低", total_commits, f"{total_dur//60} 小时只有 {total_commits} 个 commit。调试时间占比太高。"))
+        habits.append(("产出过低", total_commits, f"{total_dur//60} 小时只有 {total_commits} 次 push。调试时间占比太高。"))
     if avg_msgs > 50:
         habits.append(("消息密度过高", int(avg_msgs), "每会话消息太多，说明你在用注意力补 prompt 的不足。"))
     habits.sort(key=lambda x: x[1], reverse=True)
@@ -1971,7 +1971,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     if ratio > 2:
         horizon.append(f"目标：把 Bash/Read 比从 {ratio:.1f}:1 压到 2:1 以下。每减少 0.5，效率提升约 15%。")
     if total_commits < 5 and total_dur > 1200:
-        horizon.append(f"目标：把 commit 率从 {total_dur//max(total_commits,1) if total_commits else '∞'} 分钟/commit 降到 120 以下。")
+        horizon.append(f"目标：把 push 率从 {total_dur//max(total_commits,1) if total_commits else '∞'} 分钟/push 降到 120 以下。")
     if avg_msgs > 30:
         horizon.append("目标：把平均每会话消息数压到 20 条以下。这意味着你 upfront 的需求描述质量在提升。")
     if not horizon:
@@ -3262,7 +3262,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
 <body>
 <div class="container">
   <h1>Claude Code 洞察报告</h1>
-  <div class="subtitle">{n} 个会话 · {first_date} 至 {last_date} · {total_user_msgs:,} 条消息 · {total_dur//60} 小时 · {total_commits} 个 commit</div>
+  <div class="subtitle">{n} 个会话 · {first_date} 至 {last_date} · {total_user_msgs:,} 条消息 · {total_dur//60} 小时 · {total_commits} 次 push</div>
 
   <div class="nav">
     <a href="#overview">概览</a>
