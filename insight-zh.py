@@ -12,6 +12,7 @@ Claude Code 中文洞察报告 — 从 facets + session-meta 生成，绕过 /in
   insight-zh --no-translate    跳过 LLM 翻译（纯规则）
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -20,6 +21,9 @@ import sys
 from collections import Counter
 from datetime import datetime, date, timedelta
 from pathlib import Path
+
+from insight_zh.analysis.session_inference import build_legacy_report_item, get_git_push_count
+from insight_zh.sources.session_loader import load_sessions_from_workspace
 
 CLAUDE_DIR = Path.home() / ".claude"
 FACETS_DIR = CLAUDE_DIR / "usage-data/facets"
@@ -53,6 +57,7 @@ SESSION_TYPE_MAP = {
     "debugging": "调试",
 }
 HELPFULNESS_MAP = {
+    "essential": "关键帮助",
     "very_helpful": "非常有帮助",
     "helpful": "有帮助",
     "moderately_helpful": "有些帮助",
@@ -221,308 +226,27 @@ def load_data(start_d, end_d):
     return items
 
 
+def _load_json_if_exists(path):
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 # ── JSONL 数据源（Claude Code 2.1.140+ 新格式）──
 
+def _build_item_from_normalized_session(session):
+    """把共享 loader 的 NormalizedSession 适配回旧报告层需要的结构。"""
+    return build_legacy_report_item(session)
+
+
 def load_data_from_jsonl(start_d, end_d):
-    """从 ~/.claude/projects/*/*.jsonl 解析会话数据。
-    返回与 load_data 兼容的 {facet, meta, date} 列表。
-    增强版：提取绘画方法论分析所需的信号（用户消息文本、/compact、主题关键词等）
-    """
+    """通过共享 loader 读取 jsonl/meta/facet，并适配回旧报告结构。"""
     items = []
-    projects_dir = CLAUDE_DIR / "projects"
-    if not projects_dir.exists():
-        return items
-
-    # 主题关键词映射（用于识别会话涉及的主题领域）
-    TOPIC_KEYWORDS = {
-        "skill": ["skill", "技能", "/skill", "skill-manager", "stay-awake"],
-        "config": ["配置", "设置", "mcp", "claude.md", "settings", "权限"],
-        "debug": ["bug", "调试", "报错", "错误", "不行", "不对", "错了", "失败"],
-        "explore": ["怎么", "如何", "什么是", "区别", "对比", "为什么"],
-        "create": ["写一个", "做一个", "开发", "实现", "添加", "创建"],
-        "doc": ["README", "文档", "注释", "说明", "整理"],
-        "git": ["git", "commit", "push", "仓库", "开源", "license", "GPL", "MIT", "Apache"],
-        "test": ["测试", "验证", "看看", "试一下", "行不行", "你好", "你叫", "你是谁"],
-    }
-
-    for jsonl_path in projects_dir.rglob("*.jsonl"):
-        try:
-            session_id = jsonl_path.stem
-            user_msgs = 0
-            assist_msgs = 0
-            tool_counts = Counter()
-            first_ts = None
-            last_ts = None
-            first_prompt = ""
-            cwd = ""
-            version = ""
-            git_branch = ""
-            # 绘画方法论新增信号
-            all_user_texts = []  # 收集所有用户消息文本
-            has_compact = False  # 是否触发 /compact
-            has_command = False  # 是否使用了 /command
-            has_url = False      # 首条是否包含 URL
-            has_image = False    # 是否包含图片
-            edit_targets = set() # Edit 修改的文件路径
-            write_targets = set() # Write 写入的文件路径
-
-            with open(jsonl_path, "r", encoding="utf-8") as fp:
-                for line in fp:
-                    if not line.strip():
-                        continue
-                    try:
-                        d = json.loads(line)
-                    except Exception:
-                        continue
-
-                    ts_str = d.get("timestamp")
-                    if ts_str:
-                        try:
-                            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                            if first_ts is None or ts < first_ts:
-                                first_ts = ts
-                            if last_ts is None or ts > last_ts:
-                                last_ts = ts
-                        except Exception:
-                            pass
-
-                    t = d.get("type")
-                    if t == "user":
-                        user_msgs += 1
-                        msg = d.get("message", {})
-                        content = msg.get("content", "")
-                        text_content = ""
-                        if isinstance(content, str):
-                            text_content = content.strip()
-                        elif isinstance(content, list):
-                            for blk in content:
-                                if isinstance(blk, dict):
-                                    if blk.get("type") == "text":
-                                        text_content += blk.get("text", "") + " "
-                                    elif blk.get("type") == "image":
-                                        has_image = True
-                        text_content = text_content.strip()
-
-                        if text_content:
-                            all_user_texts.append(text_content)
-                            if "/compact" in text_content:
-                                has_compact = True
-                            if text_content.startswith("/") and not text_content.startswith("//"):
-                                has_command = True
-
-                        if not first_prompt and text_content:
-                            first_prompt = text_content
-                            if re.search(r'https?://', text_content):
-                                has_url = True
-
-                    elif t == "assistant":
-                        assist_msgs += 1
-                        msg = d.get("message", {})
-                        content = msg.get("content", [])
-                        for c in content:
-                            if c.get("type") == "tool_use":
-                                tool_name = c.get("name", "unknown")
-                                tool_counts[tool_name] += 1
-                                # 提取 Edit/Write 的文件目标
-                                if tool_name == "Edit":
-                                    input_data = c.get("input", {})
-                                    if isinstance(input_data, dict):
-                                        fp = input_data.get("file_path", "")
-                                        if fp:
-                                            edit_targets.add(fp)
-                                elif tool_name == "Write":
-                                    input_data = c.get("input", {})
-                                    if isinstance(input_data, dict):
-                                        fp = input_data.get("file_path", "")
-                                        if fp:
-                                            write_targets.add(fp)
-
-                    if not cwd:
-                        cwd = d.get("cwd", "")
-                    if not version:
-                        version = d.get("version", "")
-                    if not git_branch:
-                        git_branch = d.get("gitBranch", "")
-
-            if first_ts is None:
-                continue
-
-            dt = first_ts.astimezone().date()
-            if start_d and dt < start_d:
-                continue
-            if dt > end_d:
-                continue
-
-            # 过滤噪音：空会话、技能触发、测试输入
-            if user_msgs == 0:
-                continue
-            if first_prompt.startswith("<") and ">" in first_prompt:
-                continue
-
-            # 计算时长（上限 12 小时，防止跨天 session 失真）
-            dur_min = 0
-            if last_ts:
-                dur_min = int((last_ts - first_ts).total_seconds() / 60)
-                if dur_min > 12 * 60:
-                    dur_min = 12 * 60
-
-            # ── 绘画方法论：创作阶段识别 ──
-            all_text_lower = " ".join(all_user_texts).lower()
-            # 识别主题数量（用于画布管理分析）
-            topic_hits = Counter()
-            for topic, keywords in TOPIC_KEYWORDS.items():
-                for kw in keywords:
-                    if kw.lower() in all_text_lower:
-                        topic_hits[topic] += 1
-                        break
-
-            # 创作阶段识别
-            painting_stage = "unknown"
-            bash_count = tool_counts.get("Bash", 0)
-            read_count = tool_counts.get("Read", 0)
-            edit_count = tool_counts.get("Edit", 0)
-            write_count = tool_counts.get("Write", 0)
-            total_tools = sum(tool_counts.values())
-            edit_write = edit_count + write_count
-
-            # 试笔：短会话、测试性问候、极少工具调用
-            # 注意：first_prompt.startswith("/") 是技能调用，不是试笔
-            is_greeting = "你好" in first_prompt or "你叫" in first_prompt or "你是谁" in first_prompt or "在吗" in first_prompt or "测试" in first_prompt
-            if user_msgs <= 3 and total_tools <= 1 and is_greeting:
-                painting_stage = "test_stroke"
-            # 临摹：首条是 URL、大量 Read、少量产出
-            elif has_url and read_count > edit_write * 3 and read_count > 5:
-                painting_stage = "copying"
-            # 整理：大量 Bash/Read，极少 Edit/Write，关键词匹配
-            elif bash_count > 5 and edit_write < 2 and organize_signals >= 1:
-                painting_stage = "organizing"
-            # 装裱：写 README/文档、GitHub 相关
-            elif ("README" in all_text_lower or "文档" in all_text_lower or "README" in first_prompt) and ("github" in all_text_lower or "git" in all_text_lower or "开源" in all_text_lower or "license" in all_text_lower or "发布" in all_text_lower):
-                painting_stage = "framing"
-            # 上色：大量 Edit/Write，反复修改，有文件产出
-            elif edit_write >= 3 and (len(edit_targets) + len(write_targets) >= 2 or edit_count >= 5):
-                painting_stage = "coloring"
-            # 素描：消息多、主题发散、/compact 触发
-            elif user_msgs > 50 and len(topic_hits) >= 3 and has_compact:
-                painting_stage = "sketching"
-            # 探索：消息多、工具种类杂、无明显产出
-            elif user_msgs > 20 and len([t for t, c in tool_counts.items() if c > 0]) >= 4 and edit_write < 2:
-                painting_stage = "exploring"
-            # 默认回退：根据主要工具类型判断
-            elif edit_write >= 1:
-                painting_stage = "coloring"
-            elif read_count >= 3:
-                painting_stage = "copying"
-            elif bash_count >= 3:
-                painting_stage = "exploring"
-            elif is_greeting:
-                painting_stage = "test_stroke"
-            else:
-                painting_stage = "exploring"
-
-            # ── 能量流向分类 ──
-            energy_flow = "neutral"
-            # 调试关键词列表
-            debug_keywords = ["不行", "不对", "错了", "失败", "报错", "错误", "bug", "debug", "调试", "异常", "崩溃", "卡住", "没反应"]
-            debug_signals = sum(all_text_lower.count(kw) for kw in debug_keywords)
-            # 创造关键词列表
-            create_keywords = ["做一个", "写一个", "开发", "实现", "添加", "创建", "设计", "封装", "开源", "发布", "skill", "项目"]
-            create_signals = sum(all_text_lower.count(kw) for kw in create_keywords)
-            # 学习关键词列表
-            learn_keywords = ["区别", "什么是", "为什么", "怎么", "如何", "对比", "比较", "原理", "机制", "概念", "介绍"]
-            learn_signals = sum(all_text_lower.count(kw) for kw in learn_keywords)
-            # 整理关键词列表
-            organize_keywords = ["整理", "清理", "删除", "移除", "归档", "分类", "统计", "检查", "audit", "review"]
-            organize_signals = sum(all_text_lower.count(kw) for kw in organize_keywords)
-
-            # 消耗型：调试特征（错误关键词多、会话长、反复修正）
-            if debug_signals >= 3 and user_msgs > 30:
-                energy_flow = "consuming"
-            # 创造型：有实现信号 + 有文件产出
-            elif (create_signals >= 2 or "做一个" in all_text_lower or "写一个" in all_text_lower) and edit_write >= 2:
-                energy_flow = "creating"
-            # 整理型：整理信号 + 大量 Bash/Read（少产出）
-            elif organize_signals >= 2 and bash_count > 3 and edit_write < 3:
-                energy_flow = "organizing"
-            # 学习型：学习信号 + 有 URL 或 Read 多 + 少产出
-            elif (learn_signals >= 2 or has_url) and read_count > 3 and edit_write < 3:
-                energy_flow = "learning"
-            # 兜底：有文件产出但没明显创造信号的，归为创造型
-            elif edit_write >= 5:
-                energy_flow = "creating"
-            # 大量 Read 但没产出的，归为学习型
-            elif read_count > 5 and edit_write == 0:
-                energy_flow = "learning"
-
-            # 推断会话类型（保留旧逻辑兼容）
-            session_type = "single_task"
-            if user_msgs > 30:
-                session_type = "multi_task"
-            elif user_msgs < 5 and assist_msgs < 10:
-                session_type = "quick_question"
-            elif bash_count > 20 or read_count > 15:
-                session_type = "exploration"
-            elif edit_write > 0:
-                session_type = "iterative_refinement"
-
-            # 推断目标（从第一条用户消息）
-            goal = first_prompt[:120] if first_prompt else "未记录"
-
-            # 构造 facet（兼容旧格式，但标记为 jsonl 来源）
-            facet = {
-                "session_id": session_id,
-                "session_type": session_type,
-                "underlying_goal": goal,
-                "brief_summary": goal,
-                "outcome": "unclear_from_transcript",
-                "claude_helpfulness": "helpful",
-                "primary_success": "none",
-                "friction_counts": {},
-                "friction_detail": "",
-                "goal_categories": {},
-                "user_satisfaction_counts": {},
-                "_source": "jsonl",
-                # 绘画方法论新增字段
-                "painting_stage": painting_stage,
-                "energy_flow": energy_flow,
-                "topic_count": len(topic_hits),
-                "has_compact": has_compact,
-                "has_url": has_url,
-                "edit_targets_count": len(edit_targets),
-                "write_targets_count": len(write_targets),
-            }
-
-            # 构造 meta
-            meta = {
-                "session_id": session_id,
-                "project_path": cwd,
-                "start_time": first_ts.isoformat() if first_ts else "",
-                "duration_minutes": dur_min,
-                "user_message_count": user_msgs,
-                "assistant_message_count": assist_msgs,
-                "tool_counts": dict(tool_counts),
-                "languages": {},
-                "git_commits": 0,
-                "git_pushes": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "first_prompt": first_prompt[:200],
-                "user_interruptions": 0,
-                "user_response_times": [],
-                "tool_errors": 0,
-                "tool_error_categories": {},
-                "uses_task_agent": bool(tool_counts.get("Agent") or tool_counts.get("TaskCreate")),
-                "uses_mcp": False,
-                "version": version,
-                "git_branch": git_branch,
-                # 绘画方法论新增
-                "all_user_texts": all_user_texts,
-                "topic_hits": dict(topic_hits),
-            }
-
-            items.append({"facet": facet, "meta": meta, "date": dt})
-        except Exception:
-            continue
+    for session in load_sessions_from_workspace(start_d, end_d, CLAUDE_DIR):
+        items.append(_build_item_from_normalized_session(session))
 
     items.sort(key=lambda x: x["date"] or date.min, reverse=True)
     return items
@@ -928,7 +652,7 @@ def generate_report(items, translations=None):
         total_user_msgs += m.get("user_message_count", 0)
         total_assist_msgs += m.get("assistant_message_count", 0)
         total_dur += m.get("duration_minutes", 0)
-        total_commits += m.get("git_pushes", 0)
+        total_commits += get_git_push_count(m)
         total_input_tokens += m.get("input_tokens", 0)
         total_output_tokens += m.get("output_tokens", 0)
         for k, v in m.get("tool_counts", {}).items():
@@ -936,11 +660,17 @@ def generate_report(items, translations=None):
         for k, v in m.get("languages", {}).items():
             lang_counter[k] += v
         session_types[f.get("session_type", "unknown")] += 1
-        outcomes[f.get("outcome", "unknown")] += 1
+        outcome = f.get("outcome")
+        if outcome and outcome != "unknown":
+            outcomes[outcome] += 1
         for k, v in f.get("user_satisfaction_counts", {}).items():
             satisfactions[k] += v
-        helpfulness[f.get("claude_helpfulness", "unknown")] += 1
-        successes[f.get("primary_success", "none")] += 1
+        helpful = f.get("claude_helpfulness")
+        if helpful and helpful != "unknown":
+            helpfulness[helpful] += 1
+        primary_success = f.get("primary_success")
+        if primary_success:
+            successes[primary_success] += 1
         for k, v in f.get("friction_counts", {}).items():
             frictions[k] += 1
         fr = f.get("friction_detail", "")
@@ -975,9 +705,9 @@ def generate_report(items, translations=None):
     lines.append(f"")
     lines.append(f"**{n} 个会话 · {first_date} 至 {last_date} · {total_user_msgs} 条用户消息 · {total_dur} 分钟 · {total_commits} 次 push**")
     lines.append(f"")
-    has_jsonl = any(it.get("facet", {}).get("_source") == "jsonl" for it in items)
+    has_jsonl = any(str(it.get("facet", {}).get("_source", "")).startswith("jsonl") for it in items)
     if has_jsonl:
-        lines.append(f"> 数据范围说明：本报告基于 `~/.claude/projects/*.jsonl` 原始会话数据，共 {n} 个会话。部分字段（如目标分类、摩擦点）由启发式规则推断。不含 Claude App（桌面端/网页端）会话。")
+        lines.append(f"> 数据范围说明：本报告基于 `~/.claude/projects/*.jsonl` 原始会话数据，共 {n} 个会话；若存在对应的 facets / session-meta，会优先补充这些已分析字段。无补充数据时，部分字段（如目标分类、摩擦点）由启发式规则推断。不含 Claude App（桌面端/网页端）会话。")
     else:
         lines.append(f"> 数据范围说明：本报告基于 `/insight` 已分析的 {n} 个会话（facets 数据）。Claude App 显示你有更多跨平台会话，此处仅包含 Claude Code CLI。")
     lines.append(f"")
@@ -1156,6 +886,8 @@ def generate_report(items, translations=None):
 
     # ── Karpathy 风格深度建议（双轮轰炸之下层）──
     stats_dict = {
+        "first_date": first_date,
+        "last_date": last_date,
         "n": n,
         "total_dur": total_dur,
         "total_user_msgs": total_user_msgs,
@@ -1207,7 +939,7 @@ def generate_report(items, translations=None):
         lines.append("")
 
     # ── 底部 ──
-    has_jsonl = any(it.get("facet", {}).get("_source") == "jsonl" for it in items)
+    has_jsonl = any(str(it.get("facet", {}).get("_source", "")).startswith("jsonl") for it in items)
     data_source = "~/.claude/projects/*/*.jsonl（原始会话数据）" if has_jsonl else "~/.claude/usage-data/facets/ + session-meta/"
     lines.append("---")
     lines.append(f"\n报告生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -1243,7 +975,7 @@ def detect_anomalies(items, translations=None):
         dur = m.get("duration_minutes", 0)
         umsgs = m.get("user_message_count", 0)
         inter = m.get("user_interruptions", 0)
-        commits = m.get("git_commits", 0)
+        commits = get_git_push_count(m)
         outcome = f.get("outcome", "unknown")
         st = f.get("session_type", "unknown")
         # 时段
@@ -1413,7 +1145,7 @@ def detect_anomalies(items, translations=None):
             add_anomaly(
                 "red", "投入产出比",
                 f"「{cat}」{cd['total']} 个会话，0 次 push",
-                f"这个方向你投入了 {cd['total']} 个会话，但没有任何代码 commit 落地。",
+                f"这个方向你投入了 {cd['total']} 个会话，但没有任何代码 push 落地。",
                 f"这是典型的'修工具'模式 —— 你花时间维护基础设施，但没产生可交付的产品。"
                 f"问问自己：这些时间换来了什么？知识？还是只是消耗？",
                 samples=cat_samples,
@@ -1466,7 +1198,7 @@ def detect_anomalies(items, translations=None):
     # ── 9. 高产出会话特征 ──
     high_commit = [s for s in sess if s["commits"] >= 1]
     if len(high_commit) >= 5 and len(sess) - len(high_commit) >= 5:
-        # 对比有 commit vs 没 commit 的会话特征
+        # 对比有 push vs 没 push 的会话特征
         hc_bash = sum(s["bash"] for s in high_commit) / len(high_commit)
         hc_read = sum(s["read"] for s in high_commit) / len(high_commit)
         nc = [s for s in sess if s["commits"] == 0]
@@ -1479,9 +1211,9 @@ def detect_anomalies(items, translations=None):
                 hc_samples = [_sample(s) for s in sorted(high_commit, key=lambda x: -x["commits"])[:8]]
                 add_anomaly(
                     "green", "产出 vs 工具使用",
-                    f"产出 commit 的会话，Bash/Read 比仅 {hc_ratio:.1f}:1；没产出的会话比 {nc_ratio:.1f}:1",
-                    f"{len(high_commit)} 个有 commit 的会话平均 Bash {hc_bash:.0f} · Read {hc_read:.0f}。"
-                    f"{len(nc)} 个无 commit 的会话平均 Bash {nc_bash:.0f} · Read {nc_read:.0f}。",
+                    f"产出 push 的会话，Bash/Read 比仅 {hc_ratio:.1f}:1；没产出的会话比 {nc_ratio:.1f}:1",
+                    f"{len(high_commit)} 个有 push 的会话平均 Bash {hc_bash:.0f} · Read {hc_read:.0f}。"
+                    f"{len(nc)} 个无 push 的会话平均 Bash {nc_bash:.0f} · Read {nc_read:.0f}。",
                     f"数据明确证明：**读得多的会话更容易出活**。这是经验法则，不是直觉。",
                     samples=hc_samples,
                 )
@@ -1553,19 +1285,35 @@ def detect_anomalies(items, translations=None):
     return anomalies
 
 
+def get_advice_cache_path(stats_dict):
+    payload = {
+        "first_date": str(stats_dict.get("first_date", "")),
+        "last_date": str(stats_dict.get("last_date", "")),
+        "n": stats_dict.get("n", 0),
+        "total_dur": stats_dict.get("total_dur", 0),
+        "total_user_msgs": stats_dict.get("total_user_msgs", 0),
+        "total_commits": stats_dict.get("total_commits", 0),
+        "frictions": list(stats_dict.get("frictions", Counter()).most_common()) if hasattr(stats_dict.get("frictions"), "most_common") else stats_dict.get("frictions", {}),
+        "goals": list(stats_dict.get("goals", Counter()).most_common()) if hasattr(stats_dict.get("goals"), "most_common") else stats_dict.get("goals", {}),
+        "outcomes": list(stats_dict.get("outcomes", Counter()).most_common()) if hasattr(stats_dict.get("outcomes"), "most_common") else stats_dict.get("outcomes", {}),
+    }
+    digest = hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    first_date = stats_dict.get("first_date") or "unknown"
+    last_date = stats_dict.get("last_date") or "unknown"
+    return REPORTS_DIR / f".advice-cache-{first_date}-{last_date}-{digest}.json"
+
+
 def generate_coaching_advice(stats_dict, translations=None, force_regenerate=False):
     """调用 LLM 生成 Karpathy 风格的深度教练建议（基于证据、多维度、可执行）。
-    支持当天缓存：同一天重复跑不再调 LLM。"""
+    支持按报告范围缓存：同一份统计结果重复跑不再调 LLM。"""
     if translations is None:
         translations = {}
 
-    # 当天缓存
-    today_str = date.today().isoformat()
-    advice_cache_file = REPORTS_DIR / f".advice-cache-{today_str}.json"
+    advice_cache_file = get_advice_cache_path(stats_dict)
     if not force_regenerate and advice_cache_file.exists():
         try:
             cached = json.loads(advice_cache_file.read_text(encoding="utf-8"))
-            print(f"  使用今天的深度建议缓存（{len(cached)} 条）", file=sys.stderr)
+            print(f"  使用深度建议缓存（{len(cached)} 条）", file=sys.stderr)
             return cached
         except Exception:
             pass
@@ -1635,7 +1383,7 @@ def generate_coaching_advice(stats_dict, translations=None, force_regenerate=Fal
 
 {evidence_text}
 
-开始给出 3 条建议（每条都要有完整的标题/证据/根因/行动结构）："""
+开始给出 5 条建议（每条都要有完整的标题/证据/根因/行动结构）："""
 
     try:
         from anthropic import Anthropic
@@ -1755,7 +1503,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         translations = {}
 
     n = len(items)
-    has_jsonl = any(it.get("facet", {}).get("_source") == "jsonl" for it in items)
+    has_jsonl = any(str(it.get("facet", {}).get("_source", "")).startswith("jsonl") for it in items)
     data_source_html = "~/.claude/projects/*.jsonl（原始会话数据）" if has_jsonl else "Claude Code facets + session-meta"
     first_date = min(it["date"] for it in items if it["date"])
     last_date = max(it["date"] for it in items if it["date"])
@@ -1792,7 +1540,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         total_user_msgs += m.get("user_message_count", 0)
         total_assist_msgs += m.get("assistant_message_count", 0)
         total_dur += m.get("duration_minutes", 0)
-        total_commits += m.get("git_pushes", 0)
+        total_commits += get_git_push_count(m)
         total_input_tokens += m.get("input_tokens", 0)
         total_output_tokens += m.get("output_tokens", 0)
         for k, v in m.get("tool_counts", {}).items():
@@ -1800,12 +1548,17 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         for k, v in m.get("languages", {}).items():
             lang_counter[k] += v
         session_types[f.get("session_type", "unknown")] += 1
-        outcomes[f.get("outcome", "unknown")] += 1
+        outcome = f.get("outcome")
+        if outcome and outcome != "unknown":
+            outcomes[outcome] += 1
         for k, v in f.get("user_satisfaction_counts", {}).items():
             satisfactions[k] += v
-        helpfulness[f.get("claude_helpfulness", "unknown")] += 1
-        primary_succ = f.get("primary_success", "none")
-        successes[primary_succ] += 1
+        helpful = f.get("claude_helpfulness")
+        if helpful and helpful != "unknown":
+            helpfulness[helpful] += 1
+        primary_succ = f.get("primary_success")
+        if primary_succ:
+            successes[primary_succ] += 1
         for k, v in f.get("friction_counts", {}).items():
             frictions[k] += 1
         fr = f.get("friction_detail", "")
@@ -1821,8 +1574,9 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         # 反向索引：会话类型、达成度
         st_key = f.get("session_type", "unknown")
         session_type_sessions.setdefault(st_key, []).append((it["date"], goal_zh, sid_short))
-        oc_key = f.get("outcome", "unknown")
-        outcome_sessions.setdefault(oc_key, []).append((it["date"], goal_zh, sid_short))
+        oc_key = f.get("outcome")
+        if oc_key and oc_key != "unknown":
+            outcome_sessions.setdefault(oc_key, []).append((it["date"], goal_zh, sid_short))
         # 反向索引：时段
         st_iso = m.get("start_time", "")
         if st_iso:
@@ -1885,11 +1639,11 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         date_distribution[d]["dur"] += it["meta"].get("duration_minutes", 0)
         date_distribution[d]["msgs"] += it["meta"].get("user_message_count", 0)
 
-    # ── 新增：commit 列表（用于详情展开）──
+    # ── 新增：push 列表（用于详情展开）──
     commit_list = []
     for it in items:
         m = it["meta"]
-        commits = m.get("git_commits", 0)
+        commits = get_git_push_count(m)
         if commits > 0:
             goal = it["facet"].get("underlying_goal", "")
             goal_zh = translations.get(goal, goal) if goal else "(无目标)"
@@ -1978,7 +1732,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     if interruptions > 5:
         habits.append(("频繁打断", interruptions, "你中途打断 Claude 的次数很多。打断前先问自己：是 Claude 跑偏了，还是我没说清？"))
     if total_commits == 0 and total_dur > 600:
-        habits.append(("只探索不落地", total_dur // 60, "小时里没有 commit。你在修工具，不在做产品。"))
+        habits.append(("只探索不落地", total_dur // 60, "小时里没有 push。你在修工具，不在做产品。"))
     elif total_commits < 5 and total_dur > 1200:
         habits.append(("产出过低", total_commits, f"{total_dur//60} 小时只有 {total_commits} 次 push。调试时间占比太高。"))
     if avg_msgs > 50:
@@ -2009,7 +1763,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     if interruptions > 5:
         new_ways.append("写一个 /scope 自定义命令 —— 一键声明「今天只做 X，不改 Y」。")
     if total_commits < 5 and total_dur > 1200:
-        new_ways.append("设置番茄钟：25 分钟探索 + 5 分钟 commit —— 强制落地节奏。")
+        new_ways.append("设置番茄钟：25 分钟探索 + 5 分钟整理并 push —— 强制落地节奏。")
     if not new_ways:
         new_ways.append("数据上没有明显问题，保持当前工作流即可。")
 
@@ -2175,6 +1929,8 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
 
     # ── 调用 LLM 生成深度教练建议（基于证据）──
     stats_dict = {
+        "first_date": first_date,
+        "last_date": last_date,
         "n": n,
         "total_dur": total_dur,
         "total_user_msgs": total_user_msgs,
@@ -2218,11 +1974,11 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
             "时段 × 达成度": "时段定义：凌晨 0-6 点 / 上午 6-12 点 / 下午 12-18 点 / 晚上 18-24 点（按会话 start_time 本地时区分类）。某时段失败率 > 均值 × 1.5 且 > 15% 时触发。",
             "时段 × 工具使用": "把该时段所有会话的 Bash 总次数除以 Read 总次数。比例 > 5:1 时触发（健康基线 < 2:1）。",
             "工作方向 × 达成度": "工作方向是把每个会话的 goal_categories（细分类）通过 classify_goal() 函数归到 ~25 个大类之一。某大类失败率 > 均值 × 1.5 且失败 ≥ 2 次时触发。",
-            "投入产出比": "某工作方向投入 ≥ 10 个会话，但这些会话里 git commit 总数 = 0。",
+            "投入产出比": "某工作方向投入 ≥ 10 个会话，但这些会话里 git push 总数 = 0。",
             "沉没成本": "单个会话时长 > 60 分钟 且 用户消息 ≥ 20 条 且 outcome 是「未达成」或「部分达成」。",
             "打断频率 × 达成度": "单个会话 user_interruptions ≥ 3 次。这类会话失败率 > 均值 × 1.3 时触发。",
             "Bash 滥用": "单个会话 Bash 调用 > 30 次 且 Read 调用 < 5 次。",
-            "产出 vs 工具使用": "对比'有 commit'和'无 commit'两组会话的平均 Bash/Read 比。有 commit 组的比例 < 无 commit 组 × 0.7 时绿色触发。",
+            "产出 vs 工具使用": "对比'有 push'和'无 push'两组会话的平均 Bash/Read 比。有 push 组的比例 < 无 push 组 × 0.7 时绿色触发。",
             "时长 vs 达成度": "长会话 = 时长 > 120 分钟；短会话 = 时长 5-30 分钟。长会话完全达成率 < 短会话 × 0.7 且 < 30% 时触发。",
             "「打招呼即失败」": "underlying_goal 字段包含 '你好/greet/hello/initiate/start a conversation' 等关键词的会话。50%+ 失败时触发。",
             "时段 × 摩擦类型": "期望摩擦数 = 全局该摩擦总数 × 该时段会话占比。实际 > 期望 × 1.8 且 ≥ 3 次时触发。",
@@ -2243,7 +1999,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
                     if s["read"] > 0:
                         badges.append(f'<span class="badge badge-read">Read {s["read"]}</span>')
                     if s["commits"] > 0:
-                        badges.append(f'<span class="badge badge-commit">✅ {s["commits"]} commit</span>')
+                        badges.append(f'<span class="badge badge-commit">✅ {s["commits"]} push</span>')
                     badges.append(f'<span class="badge {oc_cls}">{oc_label}</span>')
                     if s["frictions"]:
                         fr_text = "、".join(FRICTION_MAP.get(fr, fr) for fr in s["frictions"][:3])
@@ -2388,9 +2144,9 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     <details class="ov-details">
       <summary>📐 这个数怎么算的？</summary>
       <div class="method-text">
-        <strong>定义：</strong>Claude 在这些会话期间帮你完成的 git commit 总次数。<br>
-        <strong>计算：</strong>累加每个会话的 meta.git_commits 字段。<br>
-        <strong>注意：</strong>只统计 Claude 显式创建的 commit，不含你自己在终端手动 git commit 的次数。
+        <strong>定义：</strong>Claude 在这些会话期间帮你完成的 git push 总次数。<br>
+        <strong>计算：</strong>累加每个会话的 meta.git_pushes 字段；若旧数据没有该字段，则回退到兼容字段。<br>
+        <strong>注意：</strong>只统计会话元数据里记录到的 push，不含你自己在终端手动执行但未写回元数据的次数。
       </div>
     </details>"""
 
@@ -2435,20 +2191,20 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
           {timeline_rows}
         </div>'''
 
-    # ── 新增：commit 详情列表 ──
+    # ── 新增：push 详情列表 ──
     commit_details_html = ""
     if commit_list:
         commit_rows = ""
         for c in commit_list[:20]:
             d_str = c["date"].strftime("%m-%d") if c["date"] and hasattr(c["date"], "strftime") else ""
             goal_short = c["goal"][:60] + ("…" if len(c["goal"]) > 60 else "") if c["goal"] else "(无目标)"
-            commit_rows += f'<div class="drill-row"><span class="drill-date">{d_str}</span><span class="drill-sid">{c["sid"]}</span><span>{goal_short}</span><span style="margin-left:auto;color:var(--text-dim);font-size:0.78rem;">{c["commits"]} commit · {c["dur"]}分</span></div>'
+            commit_rows += f'<div class="drill-row"><span class="drill-date">{d_str}</span><span class="drill-sid">{c["sid"]}</span><span>{goal_short}</span><span style="margin-left:auto;color:var(--text-dim);font-size:0.78rem;">{c["commits"]} push · {c["dur"]}分</span></div>'
         more_commit = ""
         if len(commit_list) > 20:
-            more_commit = f'<div class="drill-more">共 {len(commit_list)} 个有 commit 的会话</div>'
+            more_commit = f'<div class="drill-more">共 {len(commit_list)} 个有 push 的会话</div>'
         commit_details_html = f'''
         <details class="expandable" style="margin-top:16px;">
-          <summary>查看 {len(commit_list)} 个有 commit 的会话详情</summary>
+                    <summary>查看 {len(commit_list)} 个有 push 的会话详情</summary>
           <div class="drill-list">{commit_rows}{more_commit}</div>
         </details>'''
 
@@ -3327,7 +3083,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
       <div class="ov-card"><div class="ov-num">{n}</div><div class="ov-label">会话</div><div class="ov-tooltip">被 /insight 深度分析过的 Claude Code CLI 会话数（每个 facets JSON 一个）</div>{ov_session_details}</div>
       <div class="ov-card"><div class="ov-num">{total_user_msgs:,}</div><div class="ov-label">消息</div><div class="ov-tooltip">这些会话中你（用户）发出的消息总数，不含 Claude 的回复</div>{ov_msgs_details}</div>
       <div class="ov-card"><div class="ov-num">{total_dur//60}h</div><div class="ov-label">时长</div><div class="ov-tooltip">这些会话从第一条消息到最后一条消息的累计时长（小时）</div>{ov_dur_details}</div>
-      <div class="ov-card"><div class="ov-num">{total_commits}</div><div class="ov-label">Commit</div><div class="ov-tooltip">这些会话期间 Claude 帮你完成的 git commit 总次数</div>{ov_commit_details}</div>
+    <div class="ov-card"><div class="ov-num">{total_commits}</div><div class="ov-label">Push</div><div class="ov-tooltip">这些会话期间 Claude 帮你完成的 git push 总次数</div>{ov_commit_details}</div>
     </div>
 
     {timeline_html}
@@ -3366,7 +3122,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
       <div class="compare-row"><span class="compare-label">Bash/Read 比</span><div><span class="compare-value" style="color:{'#ef4444' if ratio > 2 else '#22c55e'}">{ratio:.1f}:1</span><span class="compare-target">理想 &lt; 2:1</span></div></div>
       <div class="compare-row"><span class="compare-label">平均每会话时长</span><div><span class="compare-value">{total_dur//max(n,1)} 分钟</span><span class="compare-target">{'偏长' if total_dur//max(n,1) > 120 else '正常'}</span></div></div>
       <div class="compare-row"><span class="compare-label">平均每会话消息</span><div><span class="compare-value">{total_user_msgs//max(n,1)} 条</span><span class="compare-target">{'偏高' if avg_msgs > 30 else '正常'}</span></div></div>
-      <div class="compare-row"><span class="compare-label">Commit 率</span><div><span class="compare-value" style="color:{'#ef4444' if (total_dur//max(total_commits,1) if total_commits else 9999) > 120 else '#22c55e'}">{total_dur//max(total_commits,1) if total_commits else '∞'} 分钟/commit</span><span class="compare-target">理想 &lt; 120</span></div></div>
+    <div class="compare-row"><span class="compare-label">Push 率</span><div><span class="compare-value" style="color:{'#ef4444' if (total_dur//max(total_commits,1) if total_commits else 9999) > 120 else '#22c55e'}">{total_dur//max(total_commits,1) if total_commits else '∞'} 分钟/push</span><span class="compare-target">理想 &lt; 120</span></div></div>
     </div>
 
     <h3>会话类型、结果、时段</h3>

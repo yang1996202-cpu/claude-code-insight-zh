@@ -21,6 +21,8 @@
 | `di-review.py` | /daily | 纯规则引擎，双轨制（facet + 消息推断），不调用 LLM |
 | `insight-zh.py` | /weekly /monthly | LLM 驱动，工作模式画像、坏习惯分析、反常信号、趋势追踪 |
 
+架构说明与重构路线见 `docs/ARCHITECTURE.md`。
+
 ---
 
 ## 功能特性

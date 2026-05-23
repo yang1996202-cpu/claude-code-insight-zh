@@ -21,6 +21,10 @@ from collections import Counter
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
+from insight_zh.analysis.session_inference import ABANDON_SIGNALS, ACHIEVEMENT_SIGNALS, MESSAGE_FRICTION_SIGNALS, safe_keyword_match
+from insight_zh.sources.jsonl_source import parse_jsonl_session
+from insight_zh.sources.session_loader import load_sessions_from_workspace
+
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 FACETS_DIR = CLAUDE_DIR / "usage-data/facets"
@@ -115,179 +119,22 @@ def parse_target(s):
 
 
 def parse_jsonl(path: Path):
-    """解析会话 jsonl，返回详细的工具调用和消息数据"""
-    tool_counts = Counter()
-    first_user = None
-    first_ts = None
-    last_ts = None
-    user_msgs = 0
-    interruptions = 0
-    compact_count = 0
-    # 消息级数据
-    bash_commands = []  # [(timestamp, command, could_be_read)]
-    read_files = []     # [(timestamp, file_path)]
-    message_turns = []  # [{'ts': datetime, 'type': 'user'|'assistant', 'has_tool': bool}]
-    # 按日期分组的统计（用于跨天会话精准计算）
-    tools_by_ts = []    # [(ts, tool_name)]
-    user_msg_ts = []    # [ts]
-    user_msg_texts = [] # [(ts, text)] 用户消息文本，用于内容分析
-    edited_files = []   # [(ts, file_path)] Edit 修改的文件
-    written_files = []  # [(ts, file_path)] Write 写入的文件
-
-    for line in path.open(encoding="utf-8", errors="ignore"):
-        try:
-            d = json.loads(line)
-        except Exception:
-            continue
-
-        ts = d.get("timestamp")
-        dt = None
-        if ts:
-            try:
-                dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
-                if first_ts is None:
-                    first_ts = dt
-                last_ts = dt
-            except Exception:
-                pass
-
-        msg_type = d.get("type")
-
-        if msg_type == "user":
-            user_msgs += 1
-            if dt:
-                user_msg_ts.append(dt)
-            # 提取用户消息文本（过滤系统注入的 continuation 消息）
-            msg_text = ""
-            content = d.get("message", {}).get("content")
-            if isinstance(content, str):
-                msg_text = content
-            elif isinstance(content, list):
-                for blk in content:
-                    if isinstance(blk, dict) and blk.get("type") == "text":
-                        t = blk.get("text", "")
-                        msg_text += t + " "
-            msg_text = msg_text.strip()
-            # 过滤系统消息和引用块（特征：包含特定标记）
-            has_system_markers = (
-                "<local-command-" in msg_text or
-                "<command-message>" in msg_text or
-                "<command-name>" in msg_text or
-                "[2m" in msg_text or  # ANSI 转义码
-                "[22m" in msg_text or
-                "session is being continued" in msg_text.lower() or
-                "summary below covers" in msg_text.lower() or
-                "context was compacted" in msg_text.lower()
-            )
-            # 只保存看起来是真实用户输入的消息（用于内容分析）
-            # 长度限制：3-1000 字，排除系统消息
-            if msg_text and dt and not has_system_markers and 3 <= len(msg_text) <= 1000:
-                user_msg_texts.append({"ts": dt, "text": msg_text})
-            # 检测 /compact 命令
-            if "/compact" in msg_text or "/compact" in line:
-                compact_count += 1
-            if first_user is None and msg_text:
-                first_user = msg_text
-            # 检查是否包含 tool_result（即对 assistant 工具的回应）
-            has_tool_result = False
-            if isinstance(content, list):
-                for blk in content:
-                    if isinstance(blk, dict) and blk.get("type") == "tool_result":
-                        has_tool_result = True
-                        break
-            message_turns.append({"ts": dt, "type": "user", "has_tool": has_tool_result})
-
-        elif msg_type == "assistant":
-            blocks = d.get("message", {}).get("content", [])
-            has_tool_use = False
-            if isinstance(blocks, list):
-                for block in blocks:
-                    if isinstance(block, dict) and block.get("type") == "tool_use":
-                        has_tool_use = True
-                        tool_name = block.get("name", "?")
-                        tool_counts[tool_name] += 1
-                        if dt:
-                            tools_by_ts.append((dt, tool_name))
-                        tool_input = block.get("input", {})
-
-                        if tool_name == "Bash" and isinstance(tool_input, dict):
-                            cmd = tool_input.get("command", "")
-                            if cmd:
-                                could_be_read = bool(BASH_READ_CMDS.search(cmd))
-                                bash_commands.append({
-                                    "ts": dt,
-                                    "cmd": cmd,
-                                    "could_be_read": could_be_read,
-                                    "is_explore": bool(BASH_EXPLORE_CMDS.search(cmd)),
-                                    "is_dangerous": bool(BASH_DANGEROUS.search(cmd)),
-                                })
-                        elif tool_name == "Read" and isinstance(tool_input, dict):
-                            fp = tool_input.get("file_path", "")
-                            if fp:
-                                read_files.append({"ts": dt, "path": fp})
-                        elif tool_name == "Edit" and isinstance(tool_input, dict):
-                            fp = tool_input.get("file_path", "")
-                            if fp:
-                                edited_files.append({"ts": dt, "path": fp})
-                        elif tool_name == "Write" and isinstance(tool_input, dict):
-                            fp = tool_input.get("file_path", "")
-                            if fp:
-                                written_files.append({"ts": dt, "path": fp})
-            message_turns.append({"ts": dt, "type": "assistant", "has_tool": has_tool_use})
-
-        if '"interrupted":true' in line:
-            interruptions += 1
-
-    return {
-        "tool_counts": tool_counts,
-        "first_user": first_user,
-        "first_ts": first_ts,
-        "last_ts": last_ts,
-        "user_msgs": user_msgs,
-        "interruptions": interruptions,
-        "compact_count": compact_count,
-        "bash_commands": bash_commands,
-        "read_files": read_files,
-        "edited_files": edited_files,
-        "written_files": written_files,
-        "message_turns": message_turns,
-        "tools_by_ts": tools_by_ts,
-        "user_msg_ts": user_msg_ts,
-        "user_msg_texts": user_msg_texts,
-    }
+    """解析会话 jsonl，返回详细的工具调用和消息数据。"""
+    return parse_jsonl_session(path)
 
 
 def load_sessions(start_d, end_d):
     items = []
-    if not PROJECTS_DIR.exists():
-        return items
-    for jsonl in PROJECTS_DIR.glob("*/*.jsonl"):
-        mtime = datetime.fromtimestamp(jsonl.stat().st_mtime).date()
-        if mtime < start_d or mtime > end_d:
-            continue
-        sid = jsonl.stem
-        parsed = parse_jsonl(jsonl)
-        target_dates = set()
-        if parsed["first_ts"]:
-            target_dates.add(parsed["first_ts"].date())
-        if parsed["last_ts"]:
-            target_dates.add(parsed["last_ts"].date())
-        if not any(start_d <= d <= end_d for d in target_dates):
-            continue
-        project = jsonl.parent.name.replace("-Users-yang", "~").replace("-", "/")
-        facet = {}
-        fp = FACETS_DIR / f"{sid}.json"
-        if fp.exists():
-            try:
-                facet = json.loads(fp.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+    for session in load_sessions_from_workspace(start_d, end_d, CLAUDE_DIR):
+        project = session.project_path
+        if session.jsonl_path is not None:
+            project = session.jsonl_path.parent.name.replace("-Users-yang", "~").replace("-", "/")
         items.append({
-            "session_id": sid,
+            "session_id": session.session_id,
             "project": project,
-            "parsed": parsed,
-            "facet": facet,
-            "session_date": parsed["last_ts"].date() if parsed["last_ts"] else mtime,
+            "parsed": session.raw_jsonl or parse_jsonl(session.jsonl_path),
+            "facet": dict(session.facet or {}),
+            "session_date": session.report_date,
         })
     items.sort(key=lambda x: x["parsed"]["last_ts"] or datetime.min, reverse=True)
     return items
@@ -486,30 +333,6 @@ def analyze_message_patterns(turns, target_date=None):
     }
 
 
-# 用户消息中的摩擦/达成信号关键词
-FRICTION_SIGNALS = [
-    "不对", "错了", "重来", "不是", "不要", "停", "换个", "跑偏", "偏了",
-    "没理解", "误解", "搞错", "搞混", "混乱", "不对头",
-    "不要这样", "不是这样", "方向错了", "走偏", "不对劲儿",
-]
-ACHIEVEMENT_SIGNALS = [
-    "好了", "可以了", "搞定", "完成", "谢谢", "完美", "不错", "OK", "ok",
-    "解决了", "搞定了", "没问题", "成了", "满足了", "符合", "满意",
-]
-ABANDON_SIGNALS = [
-    "算了", "先这样", "明天再说", "先放着", "暂时", "以后再", "回头",
-    "搁置", "放下", "不搞了", "先不搞", "跳过",
-]
-
-
-def _safe_keyword_match(text, keyword):
-    """安全的关键词匹配：避免子串误匹配（如「成了」匹配「生成了」）"""
-    import re
-    # 要求关键词前后不是中文字母或 ASCII 字母数字（即独立成词）
-    pattern = r'(?<![一-鿿\w])' + re.escape(keyword) + r'(?![一-鿿\w])'
-    return bool(re.search(pattern, text))
-
-
 def analyze_message_content(items, target_date=None):
     """从用户消息文本推断摩擦和达成信号（替代/补充 facet）"""
     friction_hits = []  # [(ts, text, matched_keyword)]
@@ -524,18 +347,18 @@ def analyze_message_content(items, target_date=None):
                 continue
             text = ut["text"]
             # 摩擦信号（安全匹配）
-            for kw in FRICTION_SIGNALS:
-                if _safe_keyword_match(text, kw):
+            for kw in MESSAGE_FRICTION_SIGNALS:
+                if safe_keyword_match(text, kw):
                     friction_hits.append({"ts": ut["ts"], "text": text, "kw": kw})
                     break
             # 达成信号（安全匹配）
             for kw in ACHIEVEMENT_SIGNALS:
-                if _safe_keyword_match(text, kw):
+                if safe_keyword_match(text, kw):
                     achievement_hits.append({"ts": ut["ts"], "text": text, "kw": kw})
                     break
             # 放弃信号（安全匹配）
             for kw in ABANDON_SIGNALS:
-                if _safe_keyword_match(text, kw):
+                if safe_keyword_match(text, kw):
                     abandon_hits.append({"ts": ut["ts"], "text": text, "kw": kw})
                     break
             # 短消息统计
