@@ -963,6 +963,11 @@ def generate_report(items, translations=None):
             except Exception:
                 pass
 
+    night = sum(hours.get(h, 0) for h in range(18, 24))
+    midnight = sum(hours.get(h, 0) for h in range(0, 6))
+    morning = sum(hours.get(h, 0) for h in range(6, 12))
+    afternoon = sum(hours.get(h, 0) for h in range(12, 18))
+
     total = tool_counter
 
     lines = []
@@ -1149,7 +1154,46 @@ def generate_report(items, translations=None):
         lines.append(f"**用户打断 Claude 共 {interruptions} 次。**")
         lines.append("")
 
-    # ── 观察与建议已整合进「画室观察笔记」，此处不再重复 ──
+    # ── Karpathy 风格深度建议（双轮轰炸之下层）──
+    stats_dict = {
+        "n": n,
+        "total_dur": total_dur,
+        "total_user_msgs": total_user_msgs,
+        "total_commits": total_commits,
+        "bash": tool_counter.get("Bash", 0),
+        "read": tool_counter.get("Read", 0),
+        "edit": tool_counter.get("Edit", 0),
+        "write": tool_counter.get("Write", 0),
+        "interruptions": interruptions,
+        "morning": morning,
+        "afternoon": afternoon,
+        "night": night,
+        "midnight": midnight,
+        "frictions": frictions,
+        "friction_details": friction_details,
+        "goals": goals,
+        "outcomes": outcomes,
+        "habits": [],
+    }
+    deep_advice = generate_coaching_advice(stats_dict, translations)
+    if deep_advice:
+        lines.append("## 深度建议")
+        lines.append("")
+        lines.append("*Andrej Karpathy 风格——直接、有洞察、从数据里看出认知陷阱。*")
+        lines.append("")
+        for i, a in enumerate(deep_advice, 1):
+            lines.append(f"### #{i:02d} {a['title']}")
+            lines.append("")
+            if a.get("evidence"):
+                lines.append(f"**证据：**{a['evidence']}")
+                lines.append("")
+            if a.get("cause"):
+                lines.append(f"**根因：**{a['cause']}")
+                lines.append("")
+            if a.get("action"):
+                lines.append(f"**行动：**{a['action']}")
+                lines.append("")
+        lines.append("")
 
     # ── 会话摘要精选 ──
     if brief_summaries:
@@ -1564,28 +1608,16 @@ def generate_coaching_advice(stats_dict, translations=None, force_regenerate=Fal
 直接、有洞察、不说教，从数据里看出行为模式背后的认知陷阱。
 
 下面是用户使用 Claude Code（AI 编程工具）的全部行为数据。
-他自评「用得不够好」，想真正进步。请基于这些数据，给出 **3 条**深度建议。
-
-**重要：不要重复以下已分析过的内容：**
-- Bash/Read 比过高、工具使用模式（已在「画室观察笔记」中分析）
-- 0 push、不保存草图（已在「画室观察笔记」中分析）
-- 时段分布、上午缺失（已在「画室观察笔记」中分析）
-- /compact、画布覆盖（已在「画室观察笔记」中分析）
-- 完成度、完美主义（已在「画室观察笔记」中分析）
-
-**请聚焦以下维度，给出补充性洞察：**
-1. 注意力管理：多任务切换、打断模式、深度工作窗口
-2. 长期目标对齐：当前行为与声称目标的差距、战略漂移
-3. 心智模式：对 AI 的信任度、控制欲、学习 vs 执行的偏好
-4. 社交/协作维度：是否孤立工作、是否分享成果、反馈循环
+他自评「用得不够好」，想真正进步。请基于这些数据，给出 **5 条**深度建议。
 
 **严格要求：**
 1. 每条建议必须**引用具体证据**（数字、日期、案例），不能是空话
 2. 给出**根因分析**：为什么会这样？背后的认知/习惯/工作模式问题是什么？
 3. 提出**可执行的行动**：不要空泛的「多用 Read」，而是「下周一开始，每次开会话前先 ...」
-4. 语气**直接、不奉承、不批判**，像 Karpathy 一样客观陈述事实
-5. 中文**自然流畅**，不要翻译腔，不要"赋能""核心能力"这种空词
-6. 每条建议大约 150-200 字
+4. 维度要**多样**：不只是工具使用，包括时间管理、注意力、产出节奏、心智模式、长期目标
+5. 语气**直接、不奉承、不批判**，像 Karpathy 一样客观陈述事实
+6. 中文**自然流畅**，不要翻译腔，不要"赋能""核心能力"这种空词
+7. 每条建议大约 150-200 字
 
 **输出格式**（严格遵守，每条建议之间用 `---` 分隔）：
 
