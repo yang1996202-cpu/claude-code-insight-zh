@@ -749,6 +749,21 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
     write = total.get("Write", 0)
     edit_write = edit + write
 
+    # 根据数据范围决定时间词
+    dates = [it["date"] for it in items if it["date"]]
+    if dates:
+        day_span = (max(dates) - min(dates)).days + 1
+    else:
+        day_span = 7
+    if day_span <= 7:
+        period = "周"
+    elif day_span <= 14:
+        period = "两周"
+    elif day_span <= 31:
+        period = "月"
+    else:
+        period = "段时期"
+
     # ── 收集基础数据 ──
     compact_count = 0
     topic_counts = []
@@ -780,7 +795,7 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
 
     lines.append("## 画室观察笔记")
     lines.append("")
-    lines.append(f"这周你的画室里有 {n} 张画布，总共落了 {total_user_msgs} 笔。")
+    lines.append(f"这{period}你的画室里有 {n} 张画布，总共落了 {total_user_msgs} 笔。")
     lines.append("")
 
     # ── 观察 1：速写太多，油画太少 ──
@@ -790,11 +805,11 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
     if long_sessions > 0:
         lines.append(f"只有 {long_sessions} 张画布画了超过 100 笔，算是大幅油画。")
     else:
-        lines.append("没有一张画布画了超过 100 笔——你本周没有画过任何大幅油画。")
+        lines.append(f"没有一张画布画了超过 100 笔——你这{period}没有画过任何大幅油画。")
     lines.append("")
     lines.append("Paul Graham 在《黑客与画家》里说，黑客的工作方式是**先写出一个粗糙版本，再不断修改**。画家也一样——先随便画几笔建立画面关系，再逐步深入。速写是探索，但如果没有一幅发展成油画，探索就永远只是探索。")
     lines.append("")
-    lines.append("你这周的状态像是：站在画室中央，周围摊着 26 张只画了几笔的纸，每张纸上都有一个开始但没有结束的想法。画家不会这样工作——他们会选一张速写，把它钉在画架上，画完它。")
+    lines.append(f"你这{period}的状态像是：站在画室中央，周围摊着 26 张只画了几笔的纸，每张纸上都有一个开始但没有结束的想法。画家不会这样工作——他们会选一张速写，把它钉在画架上，画完它。")
     lines.append("")
     if long_sessions == 0:
         lines.append("**明天可以试的**：打开 Claude Code 后，不要问'这个怎么做'，直接说'我要写一个做 X 的脚本'，然后写到它能跑。哪怕只有 20 行，也要让它跑起来。")
@@ -806,7 +821,7 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
     lines.append("### 观察二：你把大部分时间花在调色盘上，不在画布上")
     lines.append("")
     bash_read_ratio = bash / max(read, 1)
-    lines.append(f"你这周调了 {bash} 次颜料（Bash），在画布上落了 {edit_write} 笔（Edit/Write）。Bash/Read 比是 {bash_read_ratio:.1f}，这意味着你每读一个文件，就执行了 {bash_read_ratio:.1f} 个命令。")
+    lines.append(f"你这{period}调了 {bash} 次颜料（Bash），在画布上落了 {edit_write} 笔（Edit/Write）。Bash/Read 比是 {bash_read_ratio:.1f}，这意味着你每读一个文件，就执行了 {bash_read_ratio:.1f} 个命令。")
     lines.append("")
     lines.append("画家当然需要调颜料。但如果调色时间超过画画时间，说明两种可能：一是还没想好画什么（准备过度），二是害怕在画布上落笔（交付恐惧）。")
     lines.append("")
@@ -819,9 +834,9 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
     lines.append("### 观察三：你不保存草图")
     lines.append("")
     if total_commits == 0:
-        lines.append(f"你这周画了 {n} 张画，{edit_write} 笔落在画布上，但**一张都没推出去展览**（0 push）。")
+        lines.append(f"你这{period}画了 {n} 张画，{edit_write} 笔落在画布上，但**一张都没推出去展览**（0 push）。")
     else:
-        lines.append(f"你这周画了 {n} 张画，推出去展览了 {total_commits} 次。")
+        lines.append(f"你这{period}画了 {n} 张画，推出去展览了 {total_commits} 次。")
     lines.append("")
     lines.append("画家的草图本是最宝贵的资产。Paul Graham 说，**好的设计来自不断修改**。但你连第一版都没保存，怎么修改？没有 git 历史，你就无法回溯、无法对比、无法学习。")
     lines.append("")
@@ -834,9 +849,9 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
     lines.append("### 观察四：你在深夜画画，但深夜没有自然光")
     lines.append("")
     if morning_sessions == 0:
-        lines.append("你这周上午一次都没进过画室，晚上和凌晨却来了很多次。")
+        lines.append(f"你这{period}上午一次都没进过画室，晚上和凌晨却来了很多次。")
     else:
-        lines.append(f"你这周上午来了 {morning_sessions} 次，晚上和凌晨来了 {evening_sessions} 次。")
+        lines.append(f"你这{period}上午来了 {morning_sessions} 次，晚上和凌晨来了 {evening_sessions} 次。")
     lines.append("")
     lines.append("Paul Graham 说黑客需要**大段不被打断的时间**。但深夜不是'不被打断'，是'逃避白天的压力'。白天你不敢认真画，因为怕画不好被人看见；深夜画画是焦虑驱动的，不是创作驱动的。")
     lines.append("")
@@ -865,7 +880,7 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
     if total_commits == 0 and n > 5:
         lines.append("### 观察六：你没有展览日")
         lines.append("")
-        lines.append(f"这周 {n} 张画，{total_user_msgs} 笔，{total_dur} 分钟——但没有一张画被拿出去展览（push）。")
+        lines.append(f"这{period} {n} 张画，{total_user_msgs} 笔，{total_dur} 分钟——但没有一张画被拿出去展览（push）。")
         lines.append("")
         lines.append("Paul Graham 说，**发布早期版本**是黑客的重要习惯。画家也一样——如果一幅画永远在画室里还没画完，它就永远不存在。展览日期逼着你完成：线条不够完美？没关系。颜色不够准确？先挂上再说。")
         lines.append("")
