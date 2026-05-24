@@ -16,6 +16,14 @@ allowed-tools:
 
 ## 用法
 
+当前仓库根目录的 `di-review.py` 和 `insight-zh.py` 是稳定入口；真实实现已经迁入 `insight_zh/` 包内。
+如果后续需要维护仓库，优先改：
+
+- `insight_zh/daily_cli.py`
+- `insight_zh/insight_cli.py`
+- `insight_zh/analysis/`
+- `insight_zh/sources/`
+
 ### 快速入口（推荐）
 
 ```
@@ -72,6 +80,13 @@ python3 ~/projects/claude-code-insight-zh/insight-zh.py 7 --no-translate --print
 - 输出：工作模式画像、坏习惯分析、反常信号、改进建议
 - 支持 HTML 可视化报告
 
+### 仓库维护备注
+
+- 兼容入口保留在根目录：`di-review.py`、`insight-zh.py`
+- 不要把新逻辑继续堆进 wrapper；真正实现放到 `insight_zh/` 包里
+- 回归测试命令：`python3 -m unittest discover -s tests -v`
+- 如果只做 smoke，优先跑根目录入口，而不是直接 `python -m insight_zh...`
+
 ### Step 1: 识别模式
 
 用户输入 `/insight-zh` 时，检查参数：
@@ -118,3 +133,4 @@ python3 ~/projects/claude-code-insight-zh/insight-zh.py 7 --no-translate --print
 - 首次运行 weekly/monthly 可能需要翻译（有缓存后会快）
 - daily 报告路径：`~/.claude/daily-reports/`
 - weekly/monthly 报告路径：`~/.claude/insight-reports/`
+- 深度建议缓存按日期范围 + 摘要 hash 分桶，不再按自然日共享

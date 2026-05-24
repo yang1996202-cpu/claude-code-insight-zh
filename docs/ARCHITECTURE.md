@@ -262,6 +262,8 @@ claude-code-insight-zh/
 - 真正逻辑进 `insight_zh/` 包
 - 这样既不破坏现有入口，也为后续测试和扩展建立边界
 
+当前仓库已完成这一步：根目录 `di-review.py` / `insight-zh.py` 是兼容入口，实际实现已迁入 `insight_zh/`。
+
 ## 关键对象设计
 
 ### 1. NormalizedSession

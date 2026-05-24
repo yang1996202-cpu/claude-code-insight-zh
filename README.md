@@ -21,7 +21,29 @@
 | `di-review.py` | /daily | 纯规则引擎，双轨制（facet + 消息推断），不调用 LLM |
 | `insight-zh.py` | /weekly /monthly | LLM 驱动，工作模式画像、坏习惯分析、反常信号、趋势追踪 |
 
-架构说明与重构路线见 `docs/ARCHITECTURE.md`。
+当前根目录两个脚本是薄入口，真实实现已收敛到 `insight_zh/` 包内。架构说明与重构路线见 `docs/ARCHITECTURE.md`。
+
+## 当前结构
+
+```text
+.
+├── SKILL.md                  # Claude Code skill 入口说明
+├── di-review.py              # /daily 薄入口
+├── insight-zh.py             # /weekly /monthly 薄入口
+├── insight_zh/
+│   ├── daily_cli.py          # /daily 真实实现
+│   ├── insight_cli.py        # /weekly /monthly 真实实现
+│   ├── analysis/             # 共享启发式与分析逻辑
+│   ├── domain/               # 统一 session 模型
+│   └── sources/              # jsonl / facet / meta 数据接入
+├── docs/
+│   ├── ARCHITECTURE.md       # 架构说明与迁移路线
+│   └── review/               # 审查上下文与计划文档
+└── tests/                    # 回归测试
+```
+
+如果你只是使用这个 skill，仍然只需要关心根目录的两个入口脚本。
+如果你要继续维护这个仓库，优先改 `insight_zh/` 包内实现，不要再把逻辑堆回 wrapper。
 
 ---
 
@@ -49,8 +71,8 @@
 # 1. 克隆仓库
 git clone https://github.com/yang1996202-cpu/claude-code-insight-zh.git
 
-# 2. 安装依赖（仅 weekly/monthly 需要，用于 LLM 翻译）
-pip install anthropic
+# 2. 安装依赖
+pip install -r requirements.txt
 
 # 3. 配置 API（可选，用于翻译 facets 标签。跳过则使用原文）
 export INSIGHT_API_KEY="sk-your-key"
@@ -131,6 +153,19 @@ python3 insight-zh.py 2026-04-01 2026-05-01 --html --save
 
 产出：`~/.claude/insight-reports/YYYY-MM-DD.html`
 
+### 开发与测试
+
+```bash
+# 运行全部回归测试
+python3 -m unittest discover -s tests -v
+
+# 仅验证两个兼容入口能否正常加载
+python3 insight-zh.py 7 --print-only --no-translate
+python3 di-review.py --print-only
+```
+
+说明：根目录脚本是稳定入口，测试和人工 smoke 都应该优先从这两个入口跑，避免只验证包内局部函数。
+
 ### 终端别名（可选）
 
 在 `~/.zshrc` 中添加：
@@ -176,8 +211,10 @@ alias insight='python3 /path/to/insight-zh.py'
 ## 缓存机制
 
 - 翻译缓存：`~/.claude/insight-reports/.translation-cache.json`
-- 建议缓存：`~/.claude/insight-reports/.advice-cache-YYYY-MM-DD.json`
+- 建议缓存：`~/.claude/insight-reports/.advice-cache-<first_date>-<last_date>-<digest>.json`
 - 首次运行 weekly/monthly 需要翻译（会调用 LLM API），后续有缓存会快很多
+
+其中建议缓存不是按自然日，而是按日期范围和统计摘要分桶，避免不同时间范围误复用同一份深度建议。
 
 ---
 
