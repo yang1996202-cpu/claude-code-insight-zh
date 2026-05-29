@@ -13,6 +13,7 @@ Claude Code 中文洞察报告 — 从 facets + session-meta 生成，绕过 /in
 """
 import argparse
 import hashlib
+import html as html_lib
 import json
 import os
 import re
@@ -1641,6 +1642,221 @@ def _md_bold(text):
     return re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
 
 
+def _escape_html(value):
+    return html_lib.escape(str(value or ""), quote=True)
+
+
+def _truncate(value, limit=120):
+    value = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1].rstrip() + "…"
+
+
+def _theme_bucket(raw_categories, goal, summary):
+    raw_categories = list(raw_categories or [])
+    big_categories = {classify_goal(cat) for cat in raw_categories}
+    raw_text = " ".join(raw_categories).lower()
+    text = " ".join(raw_categories + [goal or "", summary or ""]).lower()
+
+    if (
+        "Skill 系统管理" in big_categories
+        or "系统管理" in big_categories
+        or "工具探索" in big_categories
+        or any(k in text for k in ["claude code", "insight", "usage-data", "facets", "skill"])
+        or any(k in text for k in ["缓存", "中文报告", "分析器"])
+    ):
+        return "Claude Code 工具链与分析系统"
+    if "内容创作" in big_categories or any(k in raw_text for k in ["publish", "wechat", "article", "content", "illustration"]):
+        return "内容发布与写作流水线"
+    if any(k in text for k in ["codepilot", "client", "ui", "model", "display", "sdk", "electron"]):
+        return "客户端配置与 UI 排障"
+    if any(k in text for k in ["macos", "pmset", "caffeinate", "sleep", "lid", "power"]):
+        return "macOS 与本地环境自动化"
+    if any(k in text for k in ["feishu", "lark", "knowledge", "memory", "obsidian", "nowledge", "文档", "知识"]):
+        return "知识管理与外部集成"
+    if "Git 操作" in big_categories or any(k in raw_text for k in ["github", "git", "repo", "commit", "push"]):
+        return "GitHub 与开源交付"
+    if "调试与排障" in big_categories or any(k in raw_text for k in ["debug", "bug", "fix"]):
+        return "代码修复与调试"
+    if "代码与实现" in big_categories:
+        return "代码修复与调试"
+    return "临时问答与探索"
+
+
+def _topic_reason(bucket, records):
+    sessions = len(records)
+    bash = sum(r["bash"] for r in records)
+    read = sum(r["read"] for r in records)
+    edit_write = sum(r["edit"] + r["write"] for r in records)
+    commits = sum(r["commits"] for r in records)
+    outcomes = Counter(r["outcome"] for r in records)
+    top_outcome = OUTCOME_MAP.get(outcomes.most_common(1)[0][0], outcomes.most_common(1)[0][0]) if outcomes else "未知"
+    sample = _truncate(records[0]["summary"] or records[0]["goal"], 160) if records else ""
+
+    if bucket == "Claude Code 工具链与分析系统":
+        return f"你在把 Claude Code 当成可改造的平台：围绕报告、skill、缓存、工作流做了 {sessions} 个会话，工具调用里 Bash {bash} 次、Edit/Write {edit_write} 次，说明它不是聊天问答，而是本地系统工程。代表会话：{sample}"
+    if bucket == "内容发布与写作流水线":
+        return f"这是可复用的内容生产线：{sessions} 个会话集中在文章、HTML、图片或发布链路，Read {read} 次、Edit/Write {edit_write} 次。重点不是一次写完，而是把每次摩擦沉淀成流水线能力。代表会话：{sample}"
+    if bucket == "客户端配置与 UI 排障":
+        return f"这类会话集中在 UI 显示、配置文件和真实运行行为的分层排查，共 {sessions} 个。结果多为 {top_outcome}，通常卡在第三方客户端限制或显示层/运行层混淆。代表会话：{sample}"
+    if bucket == "macOS 与本地环境自动化":
+        return f"这类工作是典型本机自动化：{sessions} 个会话围绕系统状态、命令环境和长期运行可靠性。Bash {bash} 次说明大部分成本在验证环境事实。代表会话：{sample}"
+    if bucket == "知识管理与外部集成":
+        return f"这类会话在处理知识持久化、外部系统接入和可检索记录，共 {sessions} 个。它的难点不是写代码，而是权限、数据边界和工具能力是否真实可用。代表会话：{sample}"
+    if bucket == "GitHub 与开源交付":
+        return f"这类会话最终要落到仓库、README、commit 或 push。共 {sessions} 个会话、{commits} 个 commit，重点是把个人问题包装成可复用资产。代表会话：{sample}"
+    if bucket == "代码修复与调试":
+        return f"这类会话集中在 bug、测试和修复，共 {sessions} 个，Bash {bash} 次、Read {read} 次、Edit/Write {edit_write} 次。它最需要的是先定位再改，不然容易变成命令试错。代表会话：{sample}"
+    return f"这类是低成本探索或临时问答，共 {sessions} 个。它们不一定要沉淀，但如果同一主题反复出现，就应该升级成明确项目。代表会话：{sample}"
+
+
+def build_insights_like_sections(session_records, totals):
+    if not session_records:
+        return {
+            "themes_html": "",
+            "behavior_html": "",
+            "friction_story_html": "",
+            "playbook_html": "",
+        }
+
+    theme_records = {}
+    for record in session_records:
+        bucket = _theme_bucket(record["raw_categories"], record["goal"], record["summary"])
+        theme_records.setdefault(bucket, []).append(record)
+
+    theme_cards = ""
+    for bucket, records in sorted(theme_records.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:5]:
+        reason = _topic_reason(bucket, records)
+        sessions = len(records)
+        commits = sum(r["commits"] for r in records)
+        msg_count = sum(r["user_messages"] for r in records)
+        theme_cards += f"""
+<div class="insight-card">
+  <div class="insight-card-head"><strong>{_escape_html(bucket)}</strong><span>{sessions} 个会话 · {msg_count} 条消息 · {commits} commit</span></div>
+  <p>{_escape_html(reason)}</p>
+</div>"""
+
+    themes_html = f"""
+<div class="section" id="themes">
+  <h2>你真正投入的工作流</h2>
+  <p class="section-hint">这一段按官方 /insights 的思路做：不是展示指标，而是把多个会话归并成长期推进的工作流。</p>
+  <div class="insight-stack">{theme_cards}</div>
+</div>"""
+
+    bash = totals.get("bash", 0)
+    read = totals.get("read", 0)
+    ratio = bash / max(read, 1)
+    total_msgs = totals.get("total_user_msgs", 0)
+    n = totals.get("n", 1)
+    avg_msgs = total_msgs / max(n, 1)
+    total_dur = totals.get("total_dur", 0)
+    commits = totals.get("total_commits", 0)
+    frictions = totals.get("frictions", Counter())
+    outcomes = totals.get("outcomes", Counter())
+    mostly_ok = outcomes.get("fully_achieved", 0) + outcomes.get("mostly_achieved", 0)
+    achieved_rate = mostly_ok / max(sum(outcomes.values()), 1)
+
+    behavior_bits = []
+    if ratio > 3:
+        behavior_bits.append(f"你把 Claude Code 用成了本地 shell 放大器：Bash {bash} 次、Read {read} 次，Bash/Read={ratio:.1f}:1。")
+    elif ratio > 1.5:
+        behavior_bits.append(f"你在 shell 探索和文件阅读之间摇摆：Bash {bash} 次、Read {read} 次，Bash/Read={ratio:.1f}:1。")
+    else:
+        behavior_bits.append(f"你的工具使用更接近先读后改：Bash {bash} 次、Read {read} 次，Bash/Read={ratio:.1f}:1。")
+    if avg_msgs < 15:
+        behavior_bits.append(f"平均每会话 {avg_msgs:.1f} 条用户消息，说明很多需求在开场定义得比较短，后续靠执行结果校正。")
+    else:
+        behavior_bits.append(f"平均每会话 {avg_msgs:.1f} 条用户消息，说明你经常通过多轮纠偏把需求逐步压实。")
+    behavior_bits.append(f"达成率约 {achieved_rate*100:.0f}%（完全/大部分达成），但 {commits} 个 commit 对 {total_dur//60} 小时活跃时间，说明交付节拍仍偏慢。")
+    if frictions:
+        top_fric = "、".join(FRICTION_MAP.get(k, k) for k, _ in frictions.most_common(3))
+        behavior_bits.append(f"最常见摩擦是：{top_fric}。这更像协作协议问题，不只是代码问题。")
+
+    behavior_html = f"""
+<div class="section" id="behavior">
+  <h2>你怎么使用 Claude Code</h2>
+  <div class="narrative narrative-large">
+    {''.join(f'<p>{_escape_html(bit)}</p>' for bit in behavior_bits)}
+    <div class="key-insight">核心画像：你不是把 Claude Code 当聊天机器人，而是当一个可被纠错、可被改造、可持续沉淀工具链的执行环境。</div>
+  </div>
+</div>"""
+
+    friction_cards = ""
+    for ftype, count in frictions.most_common(4):
+        label = FRICTION_MAP.get(ftype, ftype)
+        examples = []
+        for record in session_records:
+            if ftype in record["friction_counts"]:
+                detail = record["friction_detail"] or record["summary"] or record["goal"]
+                if detail:
+                    examples.append(_truncate(detail, 150))
+            if len(examples) >= 2:
+                break
+        if not examples:
+            examples = ["该摩擦有计数，但没有足够的文字细节。"]
+        if ftype in ("wrong_approach", "misunderstood_request"):
+            meaning = "Claude 在没有先把边界和事实查清前就行动，你被迫承担 reviewer 和纠偏者角色。"
+        elif ftype == "buggy_code":
+            meaning = "实现质量或验证不足，导致会话从创造变成返工。"
+        elif ftype == "user_rejected_action":
+            meaning = "Claude 做了你没有要求或不想要的动作，说明执行前确认不足。"
+        else:
+            meaning = "这类摩擦需要看具体会话，但它已经反复出现，不应只当偶发。"
+        friction_cards += f"""
+<div class="insight-card warning-card">
+  <div class="insight-card-head"><strong>{_escape_html(label)}</strong><span>{count} 次</span></div>
+  <p>{_escape_html(meaning)}</p>
+  <ul>{''.join(f'<li>{_escape_html(ex)}</li>' for ex in examples)}</ul>
+</div>"""
+
+    friction_story_html = f"""
+<div class="section" id="friction-story">
+  <h2>反复出问题的地方</h2>
+  <p class="section-hint">这一段不再只列摩擦类型，而是解释这些摩擦为什么会反复发生。</p>
+  <div class="insight-stack">{friction_cards}</div>
+</div>""" if friction_cards else ""
+
+    playbook_items = []
+    if frictions.get("wrong_approach", 0) or frictions.get("misunderstood_request", 0):
+        playbook_items.append((
+            "先验事实再方案",
+            "任何数量、路径、工具能力、系统状态，先用命令验证再下结论。没有验证就只能写“推测”。",
+        ))
+    if ratio > 2:
+        playbook_items.append((
+            "限制 Bash 探索",
+            "连续 5 个 Bash 后暂停，要求 Claude 输出当前假设、已排除项、下一步要读哪个文件。",
+        ))
+    if commits == 0 or total_dur / max(commits, 1) > 120:
+        playbook_items.append((
+            "把 commit 当作检查点",
+            "超过 60-90 分钟的会话必须留下 wip commit 或决策记录；后面可以 squash，但过程不能消失。",
+        ))
+    if avg_msgs < 15:
+        playbook_items.append((
+            "开场补三行边界",
+            "目标、不要做什么、完成标准。这样不会阻止探索，但能减少中途纠偏。",
+        ))
+    if not playbook_items:
+        playbook_items.append(("保持趋势观察", "当前没有明显重复红灯，继续观察同一指标是否连续恶化三天。"))
+
+    playbook_html = f"""
+<div class="section" id="playbook">
+  <h2>可复制到 CLAUDE.md 的协作规则</h2>
+  <div class="insight-stack">
+    {''.join(f'<div class="playbook-item"><strong>{_escape_html(title)}</strong><p>{_escape_html(body)}</p></div>' for title, body in playbook_items[:5])}
+  </div>
+</div>"""
+
+    return {
+        "themes_html": themes_html,
+        "behavior_html": behavior_html,
+        "friction_story_html": friction_story_html,
+        "playbook_html": playbook_html,
+    }
+
+
 def generate_html_report(items, translations=None, force_regenerate_advice=False):
     if not items:
         return "<html><body><h1>无数据</h1></body></html>"
@@ -1680,6 +1896,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     session_type_sessions = {}  # 反向索引：会话类型 → [(date, goal, sid), ...]
     outcome_sessions = {}    # 反向索引：达成度 → [(date, goal, sid), ...]
     hour_segment_sessions = {}  # 反向索引：时段 → [(date, goal, sid), ...]
+    session_records = []
 
     for it in items:
         m = it["meta"]
@@ -1759,6 +1976,25 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         if bs:
             brief_summaries.append((it["date"], translations.get(bs, bs)))
         interruptions += m.get("user_interruptions", 0)
+        session_records.append({
+            "date": it["date"],
+            "sid": sid_short,
+            "goal": goal_zh,
+            "summary": translations.get(bs, bs) if bs else goal_zh,
+            "raw_categories": list((f.get("goal_categories") or {}).keys()),
+            "outcome": f.get("outcome", "unknown"),
+            "session_type": f.get("session_type", "unknown"),
+            "friction_counts": dict(f.get("friction_counts") or {}),
+            "friction_detail": fr_zh,
+            "primary_success": primary_succ or "",
+            "user_messages": m.get("user_message_count", 0),
+            "duration": m.get("duration_minutes", 0),
+            "bash": (m.get("tool_counts") or {}).get("Bash", 0),
+            "read": (m.get("tool_counts") or {}).get("Read", 0),
+            "edit": (m.get("tool_counts") or {}).get("Edit", 0),
+            "write": (m.get("tool_counts") or {}).get("Write", 0),
+            "commits": get_git_commit_count(m),
+        })
 
     # ── 绘画方法论分析 ──
     hours = Counter()
@@ -2103,6 +2339,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         "habits": habits,
     }
     deep_advice = generate_coaching_advice(stats_dict, translations, force_regenerate=force_regenerate_advice)
+    insights_sections = build_insights_like_sections(session_records, stats_dict)
 
     # ── 自动反常检测 ──
     anomalies = detect_anomalies(items, translations)
@@ -2536,6 +2773,72 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
   .narrative p {{ margin-bottom: 10px; color: #334155; }}
   .narrative p:last-child {{ margin-bottom: 0; }}
   .narrative strong {{ color: #0f172a; }}
+  .narrative-large p {{ margin-bottom: 12px; }}
+  .key-insight {{
+    background: #f0fdf4;
+    border: 1px solid #bbf7d0;
+    color: #166534;
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-top: 12px;
+    font-size: 0.92rem;
+  }}
+  .insight-stack {{
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }}
+  .insight-card {{
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  }}
+  .insight-card-head {{
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: baseline;
+    margin-bottom: 8px;
+  }}
+  .insight-card-head strong {{
+    color: #0f172a;
+    font-size: 1rem;
+  }}
+  .insight-card-head span {{
+    color: var(--text-dim);
+    font-size: 0.82rem;
+    white-space: nowrap;
+  }}
+  .insight-card p {{
+    color: #334155;
+    font-size: 0.94rem;
+    line-height: 1.65;
+  }}
+  .insight-card ul {{
+    margin: 10px 0 0 18px;
+    color: #475569;
+    font-size: 0.88rem;
+  }}
+  .warning-card {{
+    border-left: 4px solid #f59e0b;
+  }}
+  .playbook-item {{
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    border-radius: 8px;
+    padding: 14px 16px;
+  }}
+  .playbook-item strong {{
+    color: #1e40af;
+    display: block;
+    margin-bottom: 4px;
+  }}
+  .playbook-item p {{
+    color: #334155;
+    font-size: 0.92rem;
+  }}
 
   /* 坏习惯 */
   .habit-list {{ display: flex; flex-direction: column; gap: 10px; }}
@@ -3221,11 +3524,14 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
 
   <div class="nav">
     <a href="#overview">概览</a>
+    <a href="#themes">工作流</a>
+    <a href="#behavior">画像</a>
     <a href="#anomalies">⚡ 反常信号</a>
-    <a href="#work">你在做什么</a>
+    <a href="#friction-story">重复摩擦</a>
     <a href="#usage">使用方式</a>
     <a href="#wins">亮点</a>
     <a href="#friction">摩擦</a>
+    <a href="#playbook">规则</a>
     <a href="#features">深度建议</a>
   </div>
 
@@ -3244,6 +3550,8 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     {"<div class='gap-alert'>" + "".join(f"<div>⚠️ {s} → {e}（空白 {d} 天）</div>" for s, e, d in sorted(gaps, key=lambda x: x[2], reverse=True)[:3]) + "</div>" if gaps else ""}
   </div>
 
+  {insights_sections["themes_html"]}
+  {insights_sections["behavior_html"]}
   {painting_section_html}\n\n  <!-- 反常信号 -->
   <div class="section" id="anomalies">
     <h2>⚡ 自动发现的反常信号</h2>
@@ -3252,9 +3560,12 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     {anomalies_html if anomalies_html else '<p style="color:var(--text-dim);">数据上没有发现显著反常 — 这是好事，说明各维度表现接近均值，没有特别突出的问题或优势。</p>'}
   </div>
 
+  {insights_sections["friction_story_html"]}
+
   <!-- 你在做什么 -->
   <div class="section" id="work">
-    <h2>你在做什么</h2>
+    <h2>工作方向明细</h2>
+    <p class="section-hint">这里保留原始 goal_categories 的聚合明细，作为上面“工作流叙事”的可追溯证据。</p>
     {goals_html}
   </div>
 
@@ -3312,6 +3623,8 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
       {frictions_drill_html}
     </div>
   </div>
+
+  {insights_sections["playbook_html"]}
 
   <!-- 深度教练建议 -->
   <div class="section" id="features">
