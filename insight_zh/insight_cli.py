@@ -583,102 +583,117 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
 
     avg_topics = sum(topic_counts) / max(len(topic_counts), 1)
     avg_msg_per_session = total_user_msgs / max(n, 1)
+    short_ratio = short_sessions / max(n, 1)
+    late_sessions = evening_sessions + midnight_sessions
+    late_ratio = late_sessions / max(n, 1)
+    bash_read_ratio = bash / max(read, 1)
+    commit_minutes = total_dur / max(total_commits, 1) if total_commits else None
+
+    if day_span <= 1:
+        action_label = "明天可以试的"
+        max_observations = 3
+    elif day_span <= 7:
+        action_label = "下周可以试的"
+        max_observations = 4
+    elif day_span <= 31:
+        action_label = "下个月可以试的"
+        max_observations = 4
+    else:
+        action_label = "下一阶段可以试的"
+        max_observations = 5
 
     lines.append("## 画室观察笔记")
     lines.append("")
     lines.append(f"这{period}你的画室里有 {n} 张画布，总共落了 {total_user_msgs} 笔。")
     lines.append("")
 
-    # ── 观察 1：速写太多，油画太少 ──
-    lines.append("### 观察一：你画了很多速写，但没有一幅发展成油画")
-    lines.append("")
-    lines.append(f"{short_sessions} 张画布只画了几笔就搁下了（少于 10 条消息），占总数的 {short_sessions/max(n,1)*100:.0f}%。")
-    if long_sessions > 0:
-        lines.append(f"只有 {long_sessions} 张画布画了超过 100 笔，算是大幅油画。")
-    else:
-        lines.append(f"没有一张画布画了超过 100 笔——你这{period}没有画过任何大幅油画。")
-    lines.append("")
-    lines.append("Paul Graham 在《黑客与画家》里说，黑客的工作方式是**先写出一个粗糙版本，再不断修改**。画家也一样——先随便画几笔建立画面关系，再逐步深入。速写是探索，但如果没有一幅发展成油画，探索就永远只是探索。")
-    lines.append("")
-    lines.append(f"你这{period}的状态像是：站在画室中央，周围摊着 {short_sessions} 张只画了几笔的纸，每张纸上都有一个开始但没有结束的想法。画家不会这样工作——他们会选一张速写，把它钉在画架上，画完它。")
-    lines.append("")
-    if long_sessions == 0:
-        lines.append("**明天可以试的**：打开 Claude Code 后，不要问'这个怎么做'，直接说'我要写一个做 X 的脚本'，然后写到它能跑。哪怕只有 20 行，也要让它跑起来。")
-    else:
-        lines.append("**明天可以试的**：选一张你最感兴趣的速写（某次短会话），把它钉在画架上画完。规则：这次会话必须产生一个可运行的文件。")
-    lines.append("")
+    def note(title, paragraphs, severity):
+        return {
+            "title": title,
+            "paragraphs": paragraphs,
+            "severity": severity,
+        }
 
-    # ── 观察 2：调色时间远超画画时间 ──
-    lines.append("### 观察二：你把大部分时间花在调色盘上，不在画布上")
-    lines.append("")
-    bash_read_ratio = bash / max(read, 1)
-    lines.append(f"你这{period}调了 {bash} 次颜料（Bash），在画布上落了 {edit_write} 笔（Edit/Write）。Bash/Read 比是 {bash_read_ratio:.1f}，这意味着你每读一个文件，就执行了 {bash_read_ratio:.1f} 个命令。")
-    lines.append("")
-    lines.append("画家当然需要调颜料。但如果调色时间超过画画时间，说明两种可能：一是还没想好画什么（准备过度），二是害怕在画布上落笔（交付恐惧）。")
-    lines.append("")
-    lines.append("Paul Graham 说，**编程和画画一样，是设计工作**。设计不是在脑子里想清楚的，是在画布上试出来的。你现在的模式是'想清楚了再画'，但画家不会这样——画家会在画布上直接试，错了就覆盖，对了就保留。")
-    lines.append("")
-    lines.append("**明天可以试的**：打开 Claude Code 的第一件事不是跑 `ls` 或 `cat`，而是直接 `Write` 一个文件。哪怕里面只有 3 行伪代码，先把它写下来。写完了再读相关文件来修改，而不是先读再写。")
-    lines.append("")
+    candidates = []
 
-    # ── 观察 3：不保存草图 ──
-    lines.append("### 观察三：你不保存草图")
-    lines.append("")
-    if total_commits == 0:
-        lines.append(f"你这{period}画了 {n} 张画，{edit_write} 笔落在画布上，但**一张都没提交到版本历史**（0 commit）。")
-    else:
-        lines.append(f"你这{period}画了 {n} 张画，提交到版本历史了 {total_commits} 次。")
-    lines.append("")
-    lines.append("画家的草图本是最宝贵的资产。Paul Graham 说，**好的设计来自不断修改**。但你连第一版都没保存，怎么修改？没有 git 历史，你就无法回溯、无法对比、无法学习。")
-    lines.append("")
-    lines.append("想象一下：梵高画《星空》时，如果每画一层就把底层完全刮掉，我们今天只能看到最后一版，看不到他是如何从草稿演变成杰作的。你的 git 历史就是草图本——它记录了你思路的演进。")
-    lines.append("")
-    lines.append("**明天可以试的**：每次 Edit 或 Write 后，立刻跑 `git add . && git commit -m 'wip: 做了什么'`。不要等'画完'，草图也要存。commit message 可以写得很随便，'试了 XX 不行'、'加了 YY 功能'都可以。重要的是保存状态。")
-    lines.append("")
+    if short_ratio >= 0.45 or long_sessions == 0:
+        if day_span <= 1:
+            title = "今天的问题不是会话少，而是很多画布只开了头"
+            action = "选今天最重要的一张短会话继续做，完成标准只设一个：产生一个能运行或能复查的产物。"
+        else:
+            title = "这段时间速写太多，真正深入的画布太少"
+            action = "从短会话里挑一个反复出现的主题，单独开会话收束成一个文件、一个提交或一个决策记录。"
+        candidates.append(note(title, [
+            f"{short_sessions} 张画布少于 10 条消息，占 {short_ratio*100:.0f}%。",
+            f"超过 100 条消息的深画布有 {long_sessions} 张；平均每张画布 {avg_msg_per_session:.1f} 笔。",
+            "速写不是问题，问题是速写没有进入第二遍。创作需要从草稿里挑一个继续加深，而不是不断开新纸。",
+            f"**{action_label}**：{action}",
+        ], short_ratio * 100 + (20 if long_sessions == 0 else 0)))
 
-    # ── 观察 4：深夜画画，但深夜没有自然光 ──
-    lines.append("### 观察四：你在深夜画画，但深夜没有自然光")
-    lines.append("")
-    if morning_sessions == 0:
-        lines.append(f"你这{period}上午一次都没进过画室，晚上和凌晨却来了 {evening_sessions + midnight_sessions} 次。")
-    else:
-        lines.append(f"你这{period}上午来了 {morning_sessions} 次，晚上和凌晨来了 {evening_sessions + midnight_sessions} 次。")
-    lines.append("")
-    lines.append("Paul Graham 说黑客需要**大段不被打断的时间**。但深夜不是'不被打断'，是'逃避白天的压力'。白天你不敢认真画，因为怕画不好被人看见；深夜画画是焦虑驱动的，不是创作驱动的。")
-    lines.append("")
-    lines.append("画家需要自然光。凌晨的画室里，你看不清颜色的真实关系，只是在凭感觉涂抹。上午的阳光最稳定，最适合做重要的决定——比如'这幅画要不要继续画下去'。")
-    lines.append("")
-    lines.append("**明天可以试的**：把最难的问题留在上午 9-11 点。打开 Claude Code 前，先拿一张纸（真的纸）写下'今天要画什么'。如果上午画不好，说明问题还没想清，去散步，不要硬画。")
-    lines.append("")
+    if bash_read_ratio > 2 or (bash > 30 and edit_write < bash * 0.5):
+        if day_span <= 1:
+            title = "今天调色盘动作偏多，落到画布上的比例不够"
+        else:
+            title = "这段时间的主要惯性是探索过量"
+        candidates.append(note(title, [
+            f"Bash {bash} 次，Read {read} 次，Edit/Write {edit_write} 次；Bash/Read 比是 {bash_read_ratio:.1f}:1。",
+            "这类数据通常说明 Claude 在环境和命令层来回试，而不是快速把判断写回代码或文档。",
+            "Paul Graham 说编程和画画一样是设计工作；设计不能只在调色盘上发生，必须回到画布。",
+            f"**{action_label}**：每次连续 5 个 Bash 后强制停一下，要求 Claude 说清楚下一笔要改哪个文件、为什么改。",
+        ], min(100, bash_read_ratio * 18)))
 
-    # ── 观察 5：画布被覆盖了 ──
+    if total_commits == 0 or (commit_minutes and commit_minutes > 120):
+        if total_commits == 0:
+            first_line = f"{edit_write} 次 Edit/Write，但没有任何 commit。"
+            severity = 95
+        else:
+            first_line = f"{total_commits} 个 commit，约 {int(commit_minutes)} 分钟/commit。"
+            severity = min(95, commit_minutes / 2)
+        candidates.append(note("草图保存频率偏低", [
+            first_line,
+            "这里统计的是底层 Git 仓库真实 commit，不区分 Claude Code、Codex、其他 AI 还是你手动提交。",
+            "如果没有版本点，报告只能看到最终状态，看不到中间判断，也就很难复盘哪一步真正有效。",
+            f"**{action_label}**：把 commit 当作工作节拍器；超过 60-90 分钟的会话，结束前至少留一个 wip commit。",
+        ], severity))
+
+    if late_ratio > 0.55 or morning_sessions == 0:
+        if morning_sessions == 0:
+            first_line = f"上午 0 次，晚上和凌晨 {late_sessions} 次。"
+        else:
+            first_line = f"上午 {morning_sessions} 次，晚上和凌晨 {late_sessions} 次，晚间占 {late_ratio*100:.0f}%。"
+        candidates.append(note("工作时段偏向晚间，复杂判断容易堆到低能量时段", [
+            first_line,
+            "深夜适合连续执行，不适合做方向判断。方向判断错了，后面 Bash、Read、Edit 都会变成补救成本。",
+            f"**{action_label}**：把最难的架构判断、范围确认、是否继续做，放到上午或下午第一段清醒时间。",
+        ], late_ratio * 80))
+
     if compact_count > 0 or long_sessions > 0:
-        lines.append("### 观察五：你的画布被覆盖了")
-        lines.append("")
+        details = []
         if compact_count > 0:
-            lines.append(f"你有 {compact_count} 次画到一半，画布满了（触发 /compact），早期的构图被后期的覆盖。")
+            details.append(f"{compact_count} 次 /compact")
         if long_sessions > 0:
-            lines.append(f"还有 {long_sessions} 张大幅油画，画了 100 多笔，但可能也在不断覆盖之前的内容。")
-        lines.append("")
-        lines.append("画家一层层叠加颜料，但不会把底层完全盖住——底层的颜色会透出来，给画面增加深度。/compact 就像把底层的颜料刮掉，只保留最上面一层。你早期的想法、失败的尝试、临时的灵感，都被覆盖了。")
-        lines.append("")
-        lines.append("Paul Graham 说，**编程是逐步细化的过程**。第一版是粗的轮廓，第二版加了颜色，第三版调整了比例。但如果每一版都覆盖了上一版，你就看不到自己是怎么从 A 走到 B 的。")
-        lines.append("")
-        lines.append("**明天可以试的**：当一张画布超过 50 条消息时，问自己是不是在画两幅不同的画。如果是，开一张新画布。不要把所有想法挤在一幅画上——画家不会在同一张画布上同时画肖像和风景。")
-        lines.append("")
+            details.append(f"{long_sessions} 个 100+ 消息会话")
+        candidates.append(note("长画布有被覆盖的风险", [
+            "、".join(details) + "。",
+            "长会话不是天然更深。超过一定长度后，早期约束、失败尝试和临时决策会被后面的上下文挤掉。",
+            "这也是为什么日报和周报要看会话摘要：摘要如果只剩最后阶段，说明过程材料已经丢了一部分。",
+            f"**{action_label}**：会话超过 50 条消息时，先生成一段决策记录；如果目标已经变了，开新会话。",
+        ], compact_count * 8 + long_sessions * 12))
 
-    # ── 观察 6：完成比完美重要 ──
-    if total_commits == 0 and n > 5:
-        lines.append("### 观察六：你没有提交点")
+    if not candidates:
+        candidates.append(note("这段数据没有明显红灯", [
+            f"{n} 个会话，{total_user_msgs} 条消息，{total_dur//60} 小时，{total_commits} 个 commit。",
+            "从画室视角看，当前更适合继续积累趋势，而不是对单日波动下重判断。",
+            f"**{action_label}**：保留同一口径连续跑几天，优先看 Bash/Read、commit 率、短会话比例是否连续恶化。",
+        ], 0))
+
+    candidates.sort(key=lambda item: item["severity"], reverse=True)
+    for idx, item in enumerate(candidates[:max_observations], 1):
+        lines.append(f"### 观察{idx}：{item['title']}")
         lines.append("")
-        lines.append(f"这{period} {n} 张画，{total_user_msgs} 笔，{total_dur} 分钟——但没有一张画被提交到版本历史（commit）。")
-        lines.append("")
-        lines.append("Paul Graham 说，**发布早期版本**是黑客的重要习惯。画家也一样——如果一幅画永远在画室里还没画完，它就永远不存在。提交点期逼着你完成：线条不够完美？没关系。颜色不够准确？先挂上再说。")
-        lines.append("")
-        lines.append("你现在的问题是完美主义瘫痪——每张画都还没准备好。但画家的秘密是：没有一幅画是真正完成的，只是在某个时刻被从画室拿走了。")
-        lines.append("")
-        lines.append('**明天可以试的**：选一个今天写的文件，不管完成度多少，跑 `git add . && git commit -m "first stroke"`。不要想这个能给别人看吗，先把版本留下来。留下版本的画才是真实的画，留在画室里的只是想象。')
-        lines.append("")
+        for paragraph in item["paragraphs"]:
+            lines.append(paragraph)
+            lines.append("")
 
     return lines
 
@@ -1611,7 +1626,7 @@ def _md_lines_to_html(md_lines):
             text = line[2:]
             text = _md_bold(text)
             html_parts.append(f"<li>{text}</li>")
-        elif line.startswith("**明天可以试的**"):
+        elif re.match(r"^\*\*[^*]*可以试的\*\*", line):
             text = _md_bold(line)
             html_parts.append(f'<div style="margin:12px 0;padding:12px 16px;background:#f0fdf4;border-left:3px solid #22c55e;border-radius:4px;">{text}</div>')
         else:
@@ -1757,7 +1772,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
                 pass
     total_tools = tool_counter
     painting_md = generate_painting_analysis(items, total_tools, total_dur, total_user_msgs, total_commits, hours, goals)
-    painting_html_content = _md_lines_to_html(painting_md)
+    painting_html_content = _md_lines_to_html([line for line in painting_md if line.strip() != "## 画室观察笔记"])
     painting_section_html = f'''<div class="section" id="painting">
   <h2>画室观察笔记</h2>
   <p style="color:var(--text-dim);margin-bottom:20px;font-size:0.95rem;">基于 Paul Graham《黑客与画家》的方法论，把你的 Claude Code 使用比作画家在画室创作。</p>

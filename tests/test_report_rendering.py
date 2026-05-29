@@ -75,6 +75,8 @@ class ReportRenderingTest(unittest.TestCase):
         self.assertIn("120 分钟/commit", html)
         self.assertIn("查看 1 个有 commit 的会话详情", html)
         self.assertIn("调试与排障", html)
+        self.assertEqual(html.count("<h2>画室观察笔记</h2>"), 1)
+        self.assertIn("明天可以试的", html)
         self.assertNotIn("Push 率", html)
 
 
