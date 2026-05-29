@@ -1,6 +1,4 @@
 # 核心依赖（Python 3.9+）
-# di-review.py 无外部依赖，纯标准库
-
-# insight-zh.py 的 LLM 翻译层需要 anthropic SDK
+# insight-zh.py 的 LLM 翻译层和深度建议需要 anthropic SDK
 # 支持任意兼容 Anthropic API 格式的服务（Kimi、DeepSeek、OpenAI 等）
 anthropic>=0.40.0

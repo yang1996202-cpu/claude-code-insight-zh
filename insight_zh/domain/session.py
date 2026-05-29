@@ -12,7 +12,7 @@ def coerce_int(value: Any, default: int = 0) -> int:
 
 
 def get_git_push_count(payload: Dict[str, Any]) -> int:
-    return coerce_int(payload.get("git_pushes", payload.get("git_commits", 0)))
+    return coerce_int(payload.get("git_activity_count", payload.get("git_commits", payload.get("git_pushes", 0))))
 
 
 @dataclass

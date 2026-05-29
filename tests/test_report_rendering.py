@@ -35,7 +35,9 @@ def sample_items():
                 "user_message_count": 8,
                 "assistant_message_count": 12,
                 "tool_counts": {"Read": 4, "Edit": 3, "Write": 1},
-                "git_pushes": 2,
+                "git_activity_count": 2,
+                "git_commits": 2,
+                "git_commit_hashes": ["abc", "def"],
                 "input_tokens": 120,
                 "output_tokens": 240,
                 "user_interruptions": 0,
@@ -55,8 +57,8 @@ class ReportRenderingTest(unittest.TestCase):
 
         report = generate_report(sample_items(), translations={})
 
-        self.assertIn("2 次 push", report)
-        self.assertIn("| Git push | 2 |", report)
+        self.assertIn("2  个 commit", report)
+        self.assertIn("| Git commit | 2 |", report)
         self.assertIn("## 你在做什么", report)
         self.assertIn("调试与排障：1", report)
         self.assertIn("代码与实现：1", report)
@@ -67,13 +69,13 @@ class ReportRenderingTest(unittest.TestCase):
 
         html = generate_html_report(sample_items(), translations={}, force_regenerate_advice=False)
 
-        self.assertIn("2 次 push", html)
-        self.assertIn("<div class=\"ov-label\">Push</div>", html)
-        self.assertIn("Push 率", html)
-        self.assertIn("120 分钟/push", html)
-        self.assertIn("查看 1 个有 push 的会话详情", html)
+        self.assertIn("2  个 commit", html)
+        self.assertIn("<div class=\"ov-label\">Commit</div>", html)
+        self.assertIn("Commit 率", html)
+        self.assertIn("120 分钟/commit", html)
+        self.assertIn("查看 1 个有 commit 的会话详情", html)
         self.assertIn("调试与排障", html)
-        self.assertNotIn("Commit 率", html)
+        self.assertNotIn("Push 率", html)
 
 
 if __name__ == "__main__":

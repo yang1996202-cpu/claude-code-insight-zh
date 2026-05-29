@@ -67,6 +67,13 @@ def index_path(claude_dir: Path) -> Path:
     return cache_root(claude_dir) / "index.json"
 
 
+def analysis_window(start_date=None, end_date=None) -> Dict[str, str]:
+    return {
+        "start_date": start_date.isoformat() if hasattr(start_date, "isoformat") else (str(start_date) if start_date else ""),
+        "end_date": end_date.isoformat() if hasattr(end_date, "isoformat") else (str(end_date) if end_date else ""),
+    }
+
+
 def source_fingerprint(jsonl_path: Path, claude_dir: Optional[Path] = None) -> Dict[str, Any]:
     stat = jsonl_path.stat()
     fingerprint = {
@@ -124,9 +131,10 @@ def _parse_report_date(meta: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def load_cached_report_item(jsonl_path: Path, claude_dir: Path) -> Optional[Dict[str, Any]]:
+def load_cached_report_item(jsonl_path: Path, claude_dir: Path, start_date=None, end_date=None) -> Optional[Dict[str, Any]]:
     session_id = jsonl_path.stem
     fingerprint = source_fingerprint(jsonl_path, claude_dir)
+    window = analysis_window(start_date, end_date)
     meta = _read_json(session_meta_dir(claude_dir) / f"{session_id}.json")
     facet = _read_json(facets_dir(claude_dir) / f"{session_id}.json")
 
@@ -135,6 +143,8 @@ def load_cached_report_item(jsonl_path: Path, claude_dir: Path) -> Optional[Dict
     if meta.get("analyzer_version") != SESSION_META_ANALYZER_VERSION:
         return None
     if facet.get("analyzer_version") != FACET_ANALYZER_VERSION:
+        return None
+    if meta.get("analysis_window") != window or facet.get("analysis_window") != window:
         return None
     if not _same_source(meta, fingerprint) or not _same_source(facet, fingerprint):
         return None
@@ -147,9 +157,11 @@ def load_cached_report_item(jsonl_path: Path, claude_dir: Path) -> Optional[Dict
     facet = dict(facet)
     meta.pop("analyzer_version", None)
     meta.pop("source_fingerprint", None)
+    meta.pop("analysis_window", None)
     meta.pop("generated_at", None)
     facet.pop("analyzer_version", None)
     facet.pop("source_fingerprint", None)
+    facet.pop("analysis_window", None)
     facet.pop("generated_at", None)
     return {
         "facet": facet,
@@ -159,9 +171,10 @@ def load_cached_report_item(jsonl_path: Path, claude_dir: Path) -> Optional[Dict
     }
 
 
-def write_report_item_cache(item: Dict[str, Any], jsonl_path: Path, claude_dir: Path) -> None:
+def write_report_item_cache(item: Dict[str, Any], jsonl_path: Path, claude_dir: Path, start_date=None, end_date=None) -> None:
     session_id = jsonl_path.stem
     fingerprint = source_fingerprint(jsonl_path, claude_dir)
+    window = analysis_window(start_date, end_date)
     generated_at = datetime.now().astimezone().isoformat()
 
     meta = dict(item.get("meta") or {})
@@ -173,22 +186,24 @@ def write_report_item_cache(item: Dict[str, Any], jsonl_path: Path, claude_dir: 
     meta.update({
         "session_id": session_id,
         "analyzer_version": SESSION_META_ANALYZER_VERSION,
+        "analysis_window": window,
         "source_fingerprint": fingerprint,
         "generated_at": generated_at,
     })
     facet.update({
         "session_id": session_id,
         "analyzer_version": FACET_ANALYZER_VERSION,
+        "analysis_window": window,
         "source_fingerprint": fingerprint,
         "generated_at": generated_at,
     })
 
     _write_json(session_meta_dir(claude_dir) / f"{session_id}.json", meta)
     _write_json(facets_dir(claude_dir) / f"{session_id}.json", facet)
-    update_index(session_id, item, fingerprint, claude_dir, generated_at)
+    update_index(session_id, item, fingerprint, claude_dir, generated_at, window)
 
 
-def update_index(session_id: str, item: Dict[str, Any], fingerprint: Dict[str, Any], claude_dir: Path, generated_at: str) -> None:
+def update_index(session_id: str, item: Dict[str, Any], fingerprint: Dict[str, Any], claude_dir: Path, generated_at: str, window: Dict[str, str]) -> None:
     path = index_path(claude_dir)
     index = _read_json(path)
     sessions = index.setdefault("sessions", {})
@@ -197,6 +212,7 @@ def update_index(session_id: str, item: Dict[str, Any], fingerprint: Dict[str, A
         "session_id": session_id,
         "report_date": report_date.isoformat() if hasattr(report_date, "isoformat") else str(report_date or ""),
         "project_path": (item.get("meta") or {}).get("project_path", ""),
+        "analysis_window": window,
         "source_fingerprint": fingerprint,
         "session_meta_analyzer_version": SESSION_META_ANALYZER_VERSION,
         "facet_analyzer_version": FACET_ANALYZER_VERSION,

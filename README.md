@@ -1,229 +1,115 @@
 # Claude Code Insight 中文报告
 
-> 一个入口，三层模式：快速日报（秒出）+ 深度周报/月报（LLM 理解）。像体检单一样帮你发现 Claude Code 使用模式，持续改进。
+> 一个中文 HTML 报告入口：1 天、7 天、30 天都走同一套原始 JSONL 分析 + 中文缓存 + 可视化报告。
 
-## 三种模式
+## 模式
 
-| 模式 | 命令 | 速度 | 引擎 | 看什么 |
-|------|------|------|------|--------|
-| **/daily** | `/insight-zh /daily` | 秒出 | 规则 + 关键词 | 今天哪里有问题？ |
-| **/weekly** | `/insight-zh /weekly` | 几分钟 | LLM 深度理解 | 这周趋势和根因 |
-| **/monthly** | `/insight-zh /monthly` | 几分钟 | LLM 深度理解 | 这个月进化了吗？ |
+| 模式 | 命令 | 看什么 |
+|------|------|--------|
+| 今日 | `python3 insight-zh.py 1 --html --save` | 今天相关会话、异常信号、活跃时长、工具使用 |
+| 周报 | `python3 insight-zh.py 7 --html --save` | 近 7 天趋势和根因 |
+| 月报 | `python3 insight-zh.py 30 --html --save` | 近 30 天长期模式 |
+| 日期范围 | `python3 insight-zh.py 2026-04-01 2026-05-01 --html --save` | 任意时间窗口 |
 
-**daily 是体检单，weekly/monthly 是专家会诊。**
+产出统一放在：
 
----
-
-## 两个引擎
-
-| 引擎 | 负责模式 | 特点 |
-|------|---------|------|
-| `di-review.py` | /daily | 纯规则引擎，双轨制（facet + 消息推断），不调用 LLM |
-| `insight-zh.py` | /weekly /monthly | LLM 驱动，工作模式画像、坏习惯分析、反常信号、趋势追踪 |
-
-当前根目录两个脚本是薄入口，真实实现已收敛到 `insight_zh/` 包内。架构说明与重构路线见 `docs/ARCHITECTURE.md`。
+```text
+~/.claude/usage-data-zh/reports/YYYY-MM-DD.html
+~/.claude/usage-data-zh/reports/YYYY-MM-DD_to_YYYY-MM-DD.html
+```
 
 ## 当前结构
 
 ```text
 .
-├── SKILL.md                  # Claude Code skill 入口说明
-├── di-review.py              # /daily 薄入口
-├── insight-zh.py             # /weekly /monthly 薄入口
+├── SKILL.md
+├── insight-zh.py              # 稳定入口
 ├── insight_zh/
-│   ├── daily_cli.py          # /daily 真实实现
-│   ├── insight_cli.py        # /weekly /monthly 真实实现
-│   ├── analysis/             # 共享启发式与分析逻辑
-│   ├── domain/               # 统一 session 模型
-│   └── sources/              # jsonl / facet / meta 数据接入
-├── docs/
-│   ├── ARCHITECTURE.md       # 架构说明与迁移路线
-│   └── review/               # 审查上下文与计划文档
-└── tests/                    # 回归测试
+│   ├── insight_cli.py         # HTML/Markdown 报告主逻辑
+│   ├── analysis/              # 启发式与绘画方法论分析
+│   ├── domain/                # 统一 session 模型
+│   └── sources/               # JSONL / 官方 facets / 中文缓存
+└── tests/
 ```
 
-如果你只是使用这个 skill，仍然只需要关心根目录的两个入口脚本。
-如果你要继续维护这个仓库，优先改 `insight_zh/` 包内实现，不要再把逻辑堆回 wrapper。
+## 数据来源
 
----
+本工具读取 Claude Code CLI 的本地使用数据：
 
-## 功能特性
+```text
+~/.claude/projects/*/*.jsonl        # 原始会话记录，主数据源
+~/.claude/usage-data/               # 官方 /insights 产物，可选增强源
+~/.claude/usage-data-zh/            # insight-zh 自己的中文缓存和报告
+```
 
-### /daily 日报
-- **双轨制达成评估**：有 /insight facet 用 facet，没有则消息推断
-- **新增指标**：/compact 次数、纯对话轮数、文件产出数、反复编辑文件数
-- **精准定位**：Bash 密集区段具体到时间点、消息摩擦信号具体到某条消息
-- **预填反思区**：自动给出观察和约束，你只需要补充
+不读取 Claude App 网页端/桌面端会话。
 
-### /weekly /monthly 深度报告
-- **工作模式画像**：编码/调试/探索/文档比例、时间分布、项目分布
-- **坏习惯检测**：Bash/Read 比超标、消息密度过高、反复修正模式
-- **反常信号**：偏离个人基线的异常行为（红色标记）
-- **趋势追踪**：任意天数范围，纵向对比
-- **LLM 翻译层**：自动翻译 facets 英文标签为中文，带缓存加速
-- **HTML 可视化**：时间线图、分布图、可折叠详情
+## 关键口径
 
----
+- **会话数**：选定日期范围内有活动的 Claude Code CLI JSONL 会话。
+- **消息数**：你实际输入的文本消息数；不含 `tool_result` 回传、`/command` 包装、local-command caveat 等系统包装。
+- **活跃时长**：按 JSONL 相邻事件时间差估算，单个空闲间隔最多计 15 分钟；墙钟跨度另存为 `elapsed_duration_minutes`，不再用来做概览时长。
+- **语义字段**：官方 facets 有就优先用官方；没有就由 insight-zh 从 JSONL 启发式推断。
+- **绘画方法论字段**：`painting_stage`、`energy_flow`、`topic_count` 等永远由 insight-zh 自己分析。
+
+## 缓存机制
+
+```text
+~/.claude/usage-data-zh/
+  session-meta/*.json
+  facets/*.json
+  reports/*.html
+  index.json
+```
+
+缓存会记录：
+
+- 原始 JSONL 的 path / mtime / size
+- 官方 `usage-data/session-meta` 和 `usage-data/facets` 的 mtime / size
+- 自动计算的 analyzer version
+
+analyzer version 由相关分析代码内容自动 hash 生成。你改了 JSONL 解析、会话合并、绘画阶段、能量流向或摩擦判断，旧缓存会自动失效，不需要手动改目录名。
 
 ## 安装
 
 ```bash
-# 1. 克隆仓库
 git clone https://github.com/yang1996202-cpu/claude-code-insight-zh.git
-
-# 2. 安装依赖
+cd claude-code-insight-zh
 pip install -r requirements.txt
+```
 
-# 3. 配置 API（可选，用于翻译 facets 标签。跳过则使用原文）
+可选：配置 LLM API，用于翻译和深度建议。
+
+```bash
 export INSIGHT_API_KEY="sk-your-key"
 export INSIGHT_API_BASE="https://api.kimi.com/coding/"
 export INSIGHT_API_MODEL="kimi-for-coding"
 ```
 
-## 数据前提
-
-本工具读取 Claude Code CLI 的本地使用数据：
-
-```
-~/.claude/projects/*/*.jsonl        # 原始会话记录（主要数据源）
-~/.claude/usage-data/facets/        # 会话分析 facets（JSON）
-~/.claude/usage-data-zh/            # insight-zh 自己的中文缓存层
-```
-
-> 只包含 Claude Code CLI 的会话，不含 Claude App（桌面端/网页端）。
-
----
+没有 `INSIGHT_API_KEY` 时，报告仍会生成，只跳过 LLM 深度建议。
 
 ## 用法
 
-### Claude Code Skill（推荐）
-
-将 `SKILL.md` 放到 `~/.claude/skills/insight-zh/` 下，即可在 Claude Code 中使用：
-
-```
-/insight-zh /daily      # 快速日报，秒出
-/insight-zh /weekly     # 深度周报，LLM 分析 7 天
-/insight-zh /monthly    # 深度月报，LLM 分析 30 天
-/insight-zh             # 无参数时询问选择
-```
-
-### 命令行直接跑
-
-#### /daily 日报
-
 ```bash
-# 今天日报（默认）
-python3 di-review.py
+# 今日 HTML 报告
+python3 insight-zh.py 1 --html --save
 
-# 指定日期
-python3 di-review.py 2026-05-13
-
-# 本周趋势
-python3 di-review.py --week
-
-# 重新生成（覆盖自动部分，保留你的反思）
-python3 di-review.py --regen
-
-# 只输出到 stdout
-python3 di-review.py --print-only
-
-# 静默模式
-python3 di-review.py --quiet
-```
-
-产出：`~/.claude/daily-reports/YYYY-MM-DD.md`
-
-#### /weekly /monthly 深度报告
-
-```bash
-# 周报（7 天）
+# 近 7 天 HTML 报告
 python3 insight-zh.py 7 --html --save
 
-# 月报（30 天）
+# 近 30 天 HTML 报告
 python3 insight-zh.py 30 --html --save
 
 # 纯文本输出
-python3 insight-zh.py 7 --print-only
-
-# 跳过翻译（更快，英文输出）
-python3 insight-zh.py 7 --no-translate --print-only
-
-# 指定日期范围
-python3 insight-zh.py 2026-04-01 2026-05-01 --html --save
+python3 insight-zh.py 7 --print-only --no-translate
 ```
 
-产出：`~/.claude/usage-data-zh/reports/YYYY-MM-DD.html`
-
-### 开发与测试
+## 开发与测试
 
 ```bash
-# 运行全部回归测试
 python3 -m unittest discover -s tests -v
-
-# 仅验证两个兼容入口能否正常加载
-python3 insight-zh.py 7 --print-only --no-translate
-python3 di-review.py --print-only
+python3 insight-zh.py 1 --html --save --no-translate
 ```
-
-说明：根目录脚本是稳定入口，测试和人工 smoke 都应该优先从这两个入口跑，避免只验证包内局部函数。
-
-### 终端别名（可选）
-
-在 `~/.zshrc` 中添加：
-
-```zsh
-alias diary='python3 /path/to/di-review.py'
-alias insight='python3 /path/to/insight-zh.py'
-```
-
----
-
-## 核心指标说明
-
-| 指标 | 含义 | 健康基线 |
-|------|------|---------|
-| Bash/Read 比 | Bash 调用次数 / Read 调用次数 | < 2.0 |
-| 消息密度 | 用户消息数 / 会话数 | < 40/会话 |
-| 达成率 | (完全达成 + 大部分达成) / 有评估会话 | > 70% |
-| /compact 次数 | 上下文压缩次数 | 越少越好 |
-| 反复编辑 | 同一文件被 Edit 2+ 次 | 开发场景合理，否则注意 |
-| Bash 质量 | cat/head/tail/wc 等本可用 Read 替代的比例 | < 15% |
-| 工具连发 | Claude 连续调用工具最多轮数 | < 8 |
-
----
-
-## 双轨制说明
-
-`/daily` 的达成与结果有两个数据来源：
-
-**基于 /insight 评估**：
-- 来源：你手动跑过 `/insight` 的 session 生成的 facet 文件
-- 特点：LLM 定性理解，准确度高，但覆盖整个 session（跨天 session 会标注）
-
-**基于消息推断**：
-- 来源：di-review.py 分析当天消息日志
-- 特点：规则引擎，从用户消息文本中推断摩擦/达成/放弃信号
-- 信号词：「不对」「错了」「重来」「好了」「搞定」「算了」等
-
-两者互补：facet 有就用 facet，没有就消息推断兜底。
-
----
-
-## 缓存机制
-
-- 中文会话缓存：`~/.claude/usage-data-zh/session-meta/*.json`
-- 中文 facets 缓存：`~/.claude/usage-data-zh/facets/*.json`
-- 中文缓存索引：`~/.claude/usage-data-zh/index.json`
-- 中文报告产物：`~/.claude/usage-data-zh/reports/YYYY-MM-DD.html`
-- 翻译缓存：`~/.claude/usage-data-zh/reports/.translation-cache.json`
-- 建议缓存：`~/.claude/usage-data-zh/reports/.advice-cache-<first_date>-<last_date>-<digest>.json`
-- 首次运行 weekly/monthly 需要翻译（会调用 LLM API），后续有缓存会快很多
-
-`usage-data-zh` 借鉴 Claude Code 内置 `/insights` 的分层逻辑：先从 `~/.claude/projects/*/*.jsonl` 解析出确定性的 session-meta，再把中文启发式 / 官方 facets 合并成 facets 缓存，最后聚合渲染 HTML/Markdown 报告。缓存会记录原始 JSONL 以及官方 `usage-data/session-meta`、`usage-data/facets` 的 mtime/size 和 analyzer version；任一来源变化或分析器版本变化时，会自动重新生成对应 session 的中文缓存。analyzer version 由相关分析代码内容自动计算，不需要手动改缓存目录名。
-
-其中建议缓存不是按自然日，而是按日期范围和统计摘要分桶，避免不同时间范围误复用同一份深度建议。
-
----
 
 ## License
 

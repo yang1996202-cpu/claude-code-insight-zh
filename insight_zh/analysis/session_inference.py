@@ -65,7 +65,7 @@ def safe_keyword_match(text, keyword):
 
 
 def get_git_push_count(meta):
-    return coerce_int(meta.get("git_pushes", meta.get("git_commits", 0)))
+    return coerce_int(meta.get("git_activity_count", meta.get("git_commits", meta.get("git_pushes", 0))))
 
 
 def infer_topic_hits(all_user_texts):
@@ -298,8 +298,9 @@ def build_legacy_report_item(session):
         "assistant_message_count": assist_msgs,
         "tool_counts": dict(tool_counts),
         "languages": {},
-        "git_commits": 0,
-        "git_pushes": git_pushes,
+        "git_commits": git_pushes,
+        "git_pushes": coerce_int(session.meta.get("git_pushes", 0)),
+        "git_activity_count": git_pushes,
         "input_tokens": session.input_tokens,
         "output_tokens": session.output_tokens,
         "first_prompt": first_prompt[:200],
@@ -316,15 +317,25 @@ def build_legacy_report_item(session):
     }
     if session.meta:
         meta.update(session.meta)
+    # Official /insights session-meta can count JSONL tool_result envelopes as
+    # user messages and wall-clock span as duration. For insight-zh reports,
+    # the parsed JSONL values below are authoritative.
     meta["session_id"] = session.session_id
     meta["project_path"] = meta.get("project_path") or session.project_path
     meta["start_time"] = meta.get("start_time") or (session.start_time.isoformat() if session.start_time else "")
-    meta["duration_minutes"] = coerce_int(meta.get("duration_minutes", session.duration_minutes)) or session.duration_minutes
-    meta["user_message_count"] = coerce_int(meta.get("user_message_count", user_msgs)) or user_msgs
-    meta["assistant_message_count"] = coerce_int(meta.get("assistant_message_count", assist_msgs)) or assist_msgs
-    meta["tool_counts"] = meta.get("tool_counts") or dict(tool_counts)
-    meta["git_pushes"] = git_pushes
-    meta["first_prompt"] = meta.get("first_prompt") or first_prompt[:200]
+    meta["duration_minutes"] = session.duration_minutes
+    meta["active_duration_minutes"] = session.duration_minutes
+    meta["elapsed_duration_minutes"] = coerce_int(raw_jsonl.get("elapsed_duration_minutes"))
+    meta["user_message_count"] = user_msgs
+    meta["jsonl_user_row_count"] = coerce_int(raw_jsonl.get("jsonl_user_rows"))
+    meta["tool_result_message_count"] = coerce_int(raw_jsonl.get("tool_result_user_rows"))
+    meta["system_user_message_count"] = coerce_int(raw_jsonl.get("system_user_rows"))
+    meta["assistant_message_count"] = assist_msgs
+    meta["tool_counts"] = dict(tool_counts)
+    meta["git_commits"] = git_pushes
+    meta["git_pushes"] = coerce_int(meta.get("git_pushes", 0))
+    meta["git_activity_count"] = git_pushes
+    meta["first_prompt"] = first_prompt[:200]
     meta["all_user_texts"] = all_user_texts
     meta["topic_hits"] = dict(topic_hits)
     meta["version"] = meta.get("version") or session.version

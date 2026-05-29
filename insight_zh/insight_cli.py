@@ -22,7 +22,7 @@ from collections import Counter
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
-from insight_zh.analysis.session_inference import build_legacy_report_item, get_git_push_count
+from insight_zh.analysis.session_inference import build_legacy_report_item, get_git_push_count as get_git_commit_count
 from insight_zh.sources.facets_source import load_facet
 from insight_zh.sources.jsonl_source import iter_project_jsonl_paths, parse_jsonl_session
 from insight_zh.sources.session_loader import merge_session_sources
@@ -132,7 +132,7 @@ def classify_goal(cat):
         return "配置与安装"
     if any(x in c for x in ["project", "repo_", "project_status", "project_evaluation", "project_assessment", "project_update", "compare_projects", "strategic_review"]):
         return "项目管理"
-    if any(x in c for x in ["git_", "git_push", "git_management", "repo_sync_check", "secure_commit", "ship_to_github", "github_upload"]):
+    if any(x in c for x in ["git_", "git_commit", "git_management", "repo_sync_check", "secure_commit", "ship_to_github", "github_upload"]):
         return "Git 操作"
     if any(x in c for x in ["market", "career", "business", "job", "interview", "research", "career_direction", "career_analysis", "resume_review", "job_analysis", "interview_preparation", "market_research", "market_comparison", "business_strategy"]):
         return "研究与策略"
@@ -199,6 +199,12 @@ def resolve_range(args):
     sys.exit(2)
 
 
+def report_basename(start_d, end_d):
+    if start_d and start_d != end_d:
+        return f"{start_d}_to_{end_d}"
+    return str(end_d or date.today())
+
+
 def load_data(start_d, end_d):
     items = []
     if not FACETS_DIR.exists():
@@ -259,7 +265,7 @@ def load_data_from_jsonl(start_d, end_d):
     """
     items = []
     for jsonl_path in iter_project_jsonl_paths(CLAUDE_DIR):
-        cached_item = load_cached_report_item(jsonl_path, CLAUDE_DIR)
+        cached_item = load_cached_report_item(jsonl_path, CLAUDE_DIR, start_d, end_d)
         if cached_item:
             item_date = cached_item.get("date")
             if start_d and item_date and item_date < start_d:
@@ -269,10 +275,10 @@ def load_data_from_jsonl(start_d, end_d):
             items.append(cached_item)
             continue
 
-        parsed = parse_jsonl_session(jsonl_path)
+        parsed = parse_jsonl_session(jsonl_path, start_date=start_d, end_date=end_d)
         first_ts = parsed.get("first_ts")
         last_ts = parsed.get("last_ts") or first_ts
-        if first_ts is None or not parsed.get("user_msgs"):
+        if first_ts is None:
             continue
 
         session_start_date = first_ts.date()
@@ -281,9 +287,7 @@ def load_data_from_jsonl(start_d, end_d):
             continue
         if session_start_date > end_d:
             continue
-
-        first_prompt = (parsed.get("first_user") or "").strip()
-        if first_prompt.startswith("<") and ">" in first_prompt:
+        if not parsed.get("user_msgs"):
             continue
 
         session_id = jsonl_path.stem
@@ -297,7 +301,7 @@ def load_data_from_jsonl(start_d, end_d):
         if session is None:
             continue
         item = _build_item_from_normalized_session(session)
-        write_report_item_cache(item, jsonl_path, CLAUDE_DIR)
+        write_report_item_cache(item, jsonl_path, CLAUDE_DIR, start_d, end_d)
         items.append(item)
 
     items.sort(key=lambda x: x["date"] or date.min, reverse=True)
@@ -512,7 +516,7 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
     2. 快速原型——先画一个粗糙版本，再不断迭代
     3. 大段连续时间——创作需要不被打断的沉浸
     4. 草图和成品一样珍贵——保存所有中间状态
-    5. 完成比完美重要——必须设定"展览日"
+    5. 完成比完美重要——必须设定"提交点"
     6. 自下而上——在过程中发现，不是严格按计划
 
     报告像画室导师的观察笔记，不是统计数据报表。
@@ -531,7 +535,9 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
         day_span = (max(dates) - min(dates)).days + 1
     else:
         day_span = 7
-    if day_span <= 7:
+    if day_span <= 1:
+        period = "天"
+    elif day_span <= 7:
         period = "周"
     elif day_span <= 14:
         period = "两周"
@@ -546,6 +552,7 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
     long_sessions = 0
     short_sessions = 0
     evening_sessions = 0
+    midnight_sessions = 0
     morning_sessions = 0
 
     for it in items:
@@ -560,9 +567,17 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
         elif umsgs < 10:
             short_sessions += 1
         # 时段
-        h = it.get("hour", 12)
+        h = 12
+        st = m.get("start_time", "")
+        if st:
+            try:
+                h = datetime.fromisoformat(st.replace("Z", "+00:00")).astimezone().hour
+            except Exception:
+                pass
         if 18 <= h <= 23:
             evening_sessions += 1
+        elif 0 <= h <= 5:
+            midnight_sessions += 1
         elif 6 <= h <= 11:
             morning_sessions += 1
 
@@ -585,7 +600,7 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
     lines.append("")
     lines.append("Paul Graham 在《黑客与画家》里说，黑客的工作方式是**先写出一个粗糙版本，再不断修改**。画家也一样——先随便画几笔建立画面关系，再逐步深入。速写是探索，但如果没有一幅发展成油画，探索就永远只是探索。")
     lines.append("")
-    lines.append(f"你这{period}的状态像是：站在画室中央，周围摊着 26 张只画了几笔的纸，每张纸上都有一个开始但没有结束的想法。画家不会这样工作——他们会选一张速写，把它钉在画架上，画完它。")
+    lines.append(f"你这{period}的状态像是：站在画室中央，周围摊着 {short_sessions} 张只画了几笔的纸，每张纸上都有一个开始但没有结束的想法。画家不会这样工作——他们会选一张速写，把它钉在画架上，画完它。")
     lines.append("")
     if long_sessions == 0:
         lines.append("**明天可以试的**：打开 Claude Code 后，不要问'这个怎么做'，直接说'我要写一个做 X 的脚本'，然后写到它能跑。哪怕只有 20 行，也要让它跑起来。")
@@ -610,9 +625,9 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
     lines.append("### 观察三：你不保存草图")
     lines.append("")
     if total_commits == 0:
-        lines.append(f"你这{period}画了 {n} 张画，{edit_write} 笔落在画布上，但**一张都没推出去展览**（0 push）。")
+        lines.append(f"你这{period}画了 {n} 张画，{edit_write} 笔落在画布上，但**一张都没提交到版本历史**（0 commit）。")
     else:
-        lines.append(f"你这{period}画了 {n} 张画，推出去展览了 {total_commits} 次。")
+        lines.append(f"你这{period}画了 {n} 张画，提交到版本历史了 {total_commits} 次。")
     lines.append("")
     lines.append("画家的草图本是最宝贵的资产。Paul Graham 说，**好的设计来自不断修改**。但你连第一版都没保存，怎么修改？没有 git 历史，你就无法回溯、无法对比、无法学习。")
     lines.append("")
@@ -625,9 +640,9 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
     lines.append("### 观察四：你在深夜画画，但深夜没有自然光")
     lines.append("")
     if morning_sessions == 0:
-        lines.append(f"你这{period}上午一次都没进过画室，晚上和凌晨却来了很多次。")
+        lines.append(f"你这{period}上午一次都没进过画室，晚上和凌晨却来了 {evening_sessions + midnight_sessions} 次。")
     else:
-        lines.append(f"你这{period}上午来了 {morning_sessions} 次，晚上和凌晨来了 {evening_sessions} 次。")
+        lines.append(f"你这{period}上午来了 {morning_sessions} 次，晚上和凌晨来了 {evening_sessions + midnight_sessions} 次。")
     lines.append("")
     lines.append("Paul Graham 说黑客需要**大段不被打断的时间**。但深夜不是'不被打断'，是'逃避白天的压力'。白天你不敢认真画，因为怕画不好被人看见；深夜画画是焦虑驱动的，不是创作驱动的。")
     lines.append("")
@@ -654,15 +669,15 @@ def generate_painting_analysis(items, total, total_dur, total_user_msgs, total_c
 
     # ── 观察 6：完成比完美重要 ──
     if total_commits == 0 and n > 5:
-        lines.append("### 观察六：你没有展览日")
+        lines.append("### 观察六：你没有提交点")
         lines.append("")
-        lines.append(f"这{period} {n} 张画，{total_user_msgs} 笔，{total_dur} 分钟——但没有一张画被拿出去展览（push）。")
+        lines.append(f"这{period} {n} 张画，{total_user_msgs} 笔，{total_dur} 分钟——但没有一张画被提交到版本历史（commit）。")
         lines.append("")
-        lines.append("Paul Graham 说，**发布早期版本**是黑客的重要习惯。画家也一样——如果一幅画永远在画室里还没画完，它就永远不存在。展览日期逼着你完成：线条不够完美？没关系。颜色不够准确？先挂上再说。")
+        lines.append("Paul Graham 说，**发布早期版本**是黑客的重要习惯。画家也一样——如果一幅画永远在画室里还没画完，它就永远不存在。提交点期逼着你完成：线条不够完美？没关系。颜色不够准确？先挂上再说。")
         lines.append("")
         lines.append("你现在的问题是完美主义瘫痪——每张画都还没准备好。但画家的秘密是：没有一幅画是真正完成的，只是在某个时刻被从画室拿走了。")
         lines.append("")
-        lines.append('**明天可以试的**：选一个今天写的文件，不管完成度多少，跑 `git init && git add . && git commit -m "first stroke" && git push`。不要想这个能给别人看吗，先推出去。推出去的画才是真实的画，留在画室里的只是想象。')
+        lines.append('**明天可以试的**：选一个今天写的文件，不管完成度多少，跑 `git add . && git commit -m "first stroke"`。不要想这个能给别人看吗，先把版本留下来。留下版本的画才是真实的画，留在画室里的只是想象。')
         lines.append("")
 
     return lines
@@ -683,6 +698,7 @@ def generate_report(items, translations=None):
     total_assist_msgs = 0
     total_dur = 0
     total_commits = 0
+    total_commit_hashes = set()
     total_input_tokens = 0
     total_output_tokens = 0
     tool_counter = Counter()
@@ -704,7 +720,12 @@ def generate_report(items, translations=None):
         total_user_msgs += m.get("user_message_count", 0)
         total_assist_msgs += m.get("assistant_message_count", 0)
         total_dur += m.get("duration_minutes", 0)
-        total_commits += get_git_push_count(m)
+        commit_hashes = m.get("git_commit_hashes") or []
+        if commit_hashes:
+            total_commit_hashes.update(str(h) for h in commit_hashes)
+            total_commits = len(total_commit_hashes)
+        else:
+            total_commits += get_git_commit_count(m)
         total_input_tokens += m.get("input_tokens", 0)
         total_output_tokens += m.get("output_tokens", 0)
         for k, v in m.get("tool_counts", {}).items():
@@ -755,7 +776,7 @@ def generate_report(items, translations=None):
     lines = []
     lines.append(f"# Claude Code 中文洞察报告")
     lines.append(f"")
-    lines.append(f"**{n} 个会话 · {first_date} 至 {last_date} · {total_user_msgs} 条用户消息 · {total_dur} 分钟 · {total_commits} 次 push**")
+    lines.append(f"**{n} 个会话 · {first_date} 至 {last_date} · {total_user_msgs} 条用户消息 · {total_dur} 分钟 · {total_commits}  个 commit**")
     lines.append(f"")
     has_jsonl = any(str(it.get("facet", {}).get("_source", "")).startswith("jsonl") for it in items)
     if has_jsonl:
@@ -773,7 +794,7 @@ def generate_report(items, translations=None):
     lines.append(f"| 用户消息 | {total_user_msgs} |")
     lines.append(f"| Claude 回复 | {total_assist_msgs} |")
     lines.append(f"| 总时长 | {total_dur} 分钟（约 {total_dur // 60} 小时） |")
-    lines.append(f"| Git push | {total_commits} |")
+    lines.append(f"| Git commit | {total_commits} |")
     lines.append(f"| Input tokens | {total_input_tokens:,} |")
     lines.append(f"| Output tokens | {total_output_tokens:,} |")
     lines.append(f"| 平均每个会话 | {total_dur // max(n, 1)} 分钟 · {total_user_msgs // max(n, 1)} 消息 |")
@@ -1027,7 +1048,7 @@ def detect_anomalies(items, translations=None):
         dur = m.get("duration_minutes", 0)
         umsgs = m.get("user_message_count", 0)
         inter = m.get("user_interruptions", 0)
-        commits = get_git_push_count(m)
+        commits = get_git_commit_count(m)
         outcome = f.get("outcome", "unknown")
         st = f.get("session_type", "unknown")
         # 时段
@@ -1196,8 +1217,8 @@ def detect_anomalies(items, translations=None):
             cat_samples = [_sample(s) for s in sess if cat in s["big_cats"]][:8]
             add_anomaly(
                 "red", "投入产出比",
-                f"「{cat}」{cd['total']} 个会话，0 次 push",
-                f"这个方向你投入了 {cd['total']} 个会话，但没有任何代码 push 落地。",
+                f"「{cat}」{cd['total']} 个会话，0  个 commit",
+                f"这个方向你投入了 {cd['total']} 个会话，但没有任何代码 commit 落地。",
                 f"这是典型的'修工具'模式 —— 你花时间维护基础设施，但没产生可交付的产品。"
                 f"问问自己：这些时间换来了什么？知识？还是只是消耗？",
                 samples=cat_samples,
@@ -1250,7 +1271,7 @@ def detect_anomalies(items, translations=None):
     # ── 9. 高产出会话特征 ──
     high_commit = [s for s in sess if s["commits"] >= 1]
     if len(high_commit) >= 5 and len(sess) - len(high_commit) >= 5:
-        # 对比有 push vs 没 push 的会话特征
+        # 对比有 commit vs 没 commit 的会话特征
         hc_bash = sum(s["bash"] for s in high_commit) / len(high_commit)
         hc_read = sum(s["read"] for s in high_commit) / len(high_commit)
         nc = [s for s in sess if s["commits"] == 0]
@@ -1263,9 +1284,9 @@ def detect_anomalies(items, translations=None):
                 hc_samples = [_sample(s) for s in sorted(high_commit, key=lambda x: -x["commits"])[:8]]
                 add_anomaly(
                     "green", "产出 vs 工具使用",
-                    f"产出 push 的会话，Bash/Read 比仅 {hc_ratio:.1f}:1；没产出的会话比 {nc_ratio:.1f}:1",
-                    f"{len(high_commit)} 个有 push 的会话平均 Bash {hc_bash:.0f} · Read {hc_read:.0f}。"
-                    f"{len(nc)} 个无 push 的会话平均 Bash {nc_bash:.0f} · Read {nc_read:.0f}。",
+                    f"产出 commit 的会话，Bash/Read 比仅 {hc_ratio:.1f}:1；没产出的会话比 {nc_ratio:.1f}:1",
+                    f"{len(high_commit)} 个有 commit 的会话平均 Bash {hc_bash:.0f} · Read {hc_read:.0f}。"
+                    f"{len(nc)} 个无 commit 的会话平均 Bash {nc_bash:.0f} · Read {nc_read:.0f}。",
                     f"数据明确证明：**读得多的会话更容易出活**。这是经验法则，不是直觉。",
                     samples=hc_samples,
                 )
@@ -1371,12 +1392,12 @@ def generate_coaching_advice(stats_dict, translations=None, force_regenerate=Fal
             pass
 
     if not API_KEY:
-        return []
+        return generate_rule_coaching_advice(stats_dict)
 
     # 构造证据材料
     s = stats_dict
     evidence_lines = []
-    evidence_lines.append(f"总览：{s['n']} 个会话，{s['total_dur']} 分钟（约 {s['total_dur']//60} 小时），{s['total_user_msgs']} 条消息，{s['total_commits']} 次 push")
+    evidence_lines.append(f"总览：{s['n']} 个会话，{s['total_dur']} 分钟（约 {s['total_dur']//60} 小时），{s['total_user_msgs']} 条消息，{s['total_commits']}  个 commit")
     evidence_lines.append(f"时间分布：凌晨 {s['midnight']}、上午 {s['morning']}、下午 {s['afternoon']}、晚上 {s['night']}")
     evidence_lines.append(f"工具使用：Bash {s['bash']} · Read {s['read']} · Edit {s['edit']} · Write {s['write']}（Bash/Read 比 {s['bash']/max(s['read'],1):.1f}）")
     evidence_lines.append(f"用户打断 Claude 共 {s['interruptions']} 次")
@@ -1516,7 +1537,62 @@ def generate_coaching_advice(stats_dict, translations=None, force_regenerate=Fal
         return advice_list
     except Exception as e:
         print(f"  (LLM 建议生成失败: {e})", file=sys.stderr)
-        return []
+        return generate_rule_coaching_advice(stats_dict)
+
+
+def generate_rule_coaching_advice(stats_dict):
+    """Fallback coaching cards when no LLM API key is configured."""
+    s = stats_dict
+    advice = []
+    bash = s.get("bash", 0)
+    read = s.get("read", 0)
+    ratio = bash / max(read, 1)
+    commits = s.get("total_commits", 0)
+    total_dur = s.get("total_dur", 0)
+    total_msgs = s.get("total_user_msgs", 0)
+    n = s.get("n", 0)
+
+    if commits == 0 and total_dur >= 180:
+        advice.append({
+            "title": "今天的工作没有留下 Git 产物",
+            "evidence": f"{n} 个会话，约 {total_dur // 60} 小时活跃时长，检测到 0 个 Git commit。",
+            "cause": "你把大量时间花在探索、排障和讨论上，但没有把中间状态固化成版本历史。",
+            "action": "明天每个超过 30 分钟的会话结束前，必须产生一次 commit，哪怕只是 wip。报告会按真实 git log 统计，不依赖是哪一个 AI 提交。",
+        })
+    elif commits > 0 and total_dur / max(commits, 1) > 120:
+        advice.append({
+            "title": "有 commit，但落地频率偏低",
+            "evidence": f"约 {total_dur // 60} 小时活跃时长，检测到 {commits} 个 Git commit，约 {int(total_dur / commits)} 分钟/commit。",
+            "cause": "你不是完全没有产出，而是产出间隔太长。长时间探索后才提交，会让中间判断和失败路径消失。",
+            "action": "把 commit 当作工作节拍器：每 60-90 分钟至少提交一次 wip，后面可以 squash，但当天不能没有过程记录。",
+        })
+
+    if ratio > 2:
+        advice.append({
+            "title": "Shell 探索压过了文件理解",
+            "evidence": f"Bash {bash} 次，Read {read} 次，Bash/Read 比 {ratio:.1f}:1。",
+            "cause": "这通常意味着 Claude 在用命令行试探系统，而不是先读关键文件建立模型。",
+            "action": "给下一次会话加硬约束：前 5 分钟只允许 Read/Grep，不允许 Bash 改状态；需要执行命令时先说明目的。",
+        })
+
+    avg_msgs = total_msgs / max(n, 1)
+    if avg_msgs > 12:
+        advice.append({
+            "title": "你在用来回修正补足开场定义",
+            "evidence": f"平均每个会话 {avg_msgs:.1f} 条真实用户消息。",
+            "cause": "消息数不算离谱，但已经说明不少需求是在过程中逐步补充的。",
+            "action": "开新会话前先写三行：目标、不要做什么、完成标准。这样能减少后续纠偏。",
+        })
+
+    if not advice:
+        advice.append({
+            "title": "今天的使用模式没有明显红灯",
+            "evidence": f"{n} 个会话，{total_msgs} 条真实用户消息，约 {total_dur // 60} 小时活跃时长。",
+            "cause": "从规则指标看，当前最大问题不是单点故障，而是需要继续积累趋势数据。",
+            "action": "继续每天生成 HTML 报告，重点看 Git 产物、Bash/Read 比、异常信号是否连续三天恶化。",
+        })
+
+    return advice[:5]
 
 
 
@@ -1567,6 +1643,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     total_assist_msgs = 0
     total_dur = 0
     total_commits = 0
+    total_commit_hashes = set()
     total_input_tokens = 0
     total_output_tokens = 0
     tool_counter = Counter()
@@ -1595,7 +1672,12 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         total_user_msgs += m.get("user_message_count", 0)
         total_assist_msgs += m.get("assistant_message_count", 0)
         total_dur += m.get("duration_minutes", 0)
-        total_commits += get_git_push_count(m)
+        commit_hashes = m.get("git_commit_hashes") or []
+        if commit_hashes:
+            total_commit_hashes.update(str(h) for h in commit_hashes)
+            total_commits = len(total_commit_hashes)
+        else:
+            total_commits += get_git_commit_count(m)
         total_input_tokens += m.get("input_tokens", 0)
         total_output_tokens += m.get("output_tokens", 0)
         for k, v in m.get("tool_counts", {}).items():
@@ -1694,11 +1776,11 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         date_distribution[d]["dur"] += it["meta"].get("duration_minutes", 0)
         date_distribution[d]["msgs"] += it["meta"].get("user_message_count", 0)
 
-    # ── 新增：push 列表（用于详情展开）──
+    # ── 新增：commit 列表（用于详情展开）──
     commit_list = []
     for it in items:
         m = it["meta"]
-        commits = get_git_push_count(m)
+        commits = get_git_commit_count(m)
         if commits > 0:
             goal = it["facet"].get("underlying_goal", "")
             goal_zh = translations.get(goal, goal) if goal else "(无目标)"
@@ -1787,9 +1869,9 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     if interruptions > 5:
         habits.append(("频繁打断", interruptions, "你中途打断 Claude 的次数很多。打断前先问自己：是 Claude 跑偏了，还是我没说清？"))
     if total_commits == 0 and total_dur > 600:
-        habits.append(("只探索不落地", total_dur // 60, "小时里没有 push。你在修工具，不在做产品。"))
+        habits.append(("只探索不落地", total_dur // 60, "小时里没有 commit。你在修工具，不在做产品。"))
     elif total_commits < 5 and total_dur > 1200:
-        habits.append(("产出过低", total_commits, f"{total_dur//60} 小时只有 {total_commits} 次 push。调试时间占比太高。"))
+        habits.append(("产出过低", total_commits, f"{total_dur//60} 小时只有 {total_commits}  个 commit。调试时间占比太高。"))
     if avg_msgs > 50:
         habits.append(("消息密度过高", int(avg_msgs), "每会话消息太多，说明你在用注意力补 prompt 的不足。"))
     habits.sort(key=lambda x: x[1], reverse=True)
@@ -1818,7 +1900,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     if interruptions > 5:
         new_ways.append("写一个 /scope 自定义命令 —— 一键声明「今天只做 X，不改 Y」。")
     if total_commits < 5 and total_dur > 1200:
-        new_ways.append("设置番茄钟：25 分钟探索 + 5 分钟整理并 push —— 强制落地节奏。")
+        new_ways.append("设置番茄钟：25 分钟探索 + 5 分钟整理并 commit —— 强制落地节奏。")
     if not new_ways:
         new_ways.append("数据上没有明显问题，保持当前工作流即可。")
 
@@ -1827,7 +1909,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     if ratio > 2:
         horizon.append(f"目标：把 Bash/Read 比从 {ratio:.1f}:1 压到 2:1 以下。每减少 0.5，效率提升约 15%。")
     if total_commits < 5 and total_dur > 1200:
-        horizon.append(f"目标：把 push 率从 {total_dur//max(total_commits,1) if total_commits else '∞'} 分钟/push 降到 120 以下。")
+        horizon.append(f"目标：把 commit 率从 {total_dur//max(total_commits,1) if total_commits else '∞'} 分钟/commit 降到 120 以下。")
     if avg_msgs > 30:
         horizon.append("目标：把平均每会话消息数压到 20 条以下。这意味着你 upfront 的需求描述质量在提升。")
     if not horizon:
@@ -2029,11 +2111,11 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
             "时段 × 达成度": "时段定义：凌晨 0-6 点 / 上午 6-12 点 / 下午 12-18 点 / 晚上 18-24 点（按会话 start_time 本地时区分类）。某时段失败率 > 均值 × 1.5 且 > 15% 时触发。",
             "时段 × 工具使用": "把该时段所有会话的 Bash 总次数除以 Read 总次数。比例 > 5:1 时触发（健康基线 < 2:1）。",
             "工作方向 × 达成度": "工作方向是把每个会话的 goal_categories（细分类）通过 classify_goal() 函数归到 ~25 个大类之一。某大类失败率 > 均值 × 1.5 且失败 ≥ 2 次时触发。",
-            "投入产出比": "某工作方向投入 ≥ 10 个会话，但这些会话里 git push 总数 = 0。",
+            "投入产出比": "某工作方向投入 ≥ 10 个会话，但这些会话里 git commit 总数 = 0。",
             "沉没成本": "单个会话时长 > 60 分钟 且 用户消息 ≥ 20 条 且 outcome 是「未达成」或「部分达成」。",
             "打断频率 × 达成度": "单个会话 user_interruptions ≥ 3 次。这类会话失败率 > 均值 × 1.3 时触发。",
             "Bash 滥用": "单个会话 Bash 调用 > 30 次 且 Read 调用 < 5 次。",
-            "产出 vs 工具使用": "对比'有 push'和'无 push'两组会话的平均 Bash/Read 比。有 push 组的比例 < 无 push 组 × 0.7 时绿色触发。",
+            "产出 vs 工具使用": "对比'有 commit'和'无 commit'两组会话的平均 Bash/Read 比。有 commit 组的比例 < 无 commit 组 × 0.7 时绿色触发。",
             "时长 vs 达成度": "长会话 = 时长 > 120 分钟；短会话 = 时长 5-30 分钟。长会话完全达成率 < 短会话 × 0.7 且 < 30% 时触发。",
             "「打招呼即失败」": "underlying_goal 字段包含 '你好/greet/hello/initiate/start a conversation' 等关键词的会话。50%+ 失败时触发。",
             "时段 × 摩擦类型": "期望摩擦数 = 全局该摩擦总数 × 该时段会话占比。实际 > 期望 × 1.8 且 ≥ 3 次时触发。",
@@ -2054,7 +2136,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
                     if s["read"] > 0:
                         badges.append(f'<span class="badge badge-read">Read {s["read"]}</span>')
                     if s["commits"] > 0:
-                        badges.append(f'<span class="badge badge-commit">✅ {s["commits"]} push</span>')
+                        badges.append(f'<span class="badge badge-commit">✅ {s["commits"]} commit</span>')
                     badges.append(f'<span class="badge {oc_cls}">{oc_label}</span>')
                     if s["frictions"]:
                         fr_text = "、".join(FRICTION_MAP.get(fr, fr) for fr in s["frictions"][:3])
@@ -2162,9 +2244,9 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     <details class="ov-details">
       <summary>📐 这个数怎么算的？</summary>
       <div class="method-text">
-        <strong>定义：</strong>从 Claude Code CLI 原始会话数据（jsonl）解析的会话数量。<br>
-        <strong>数据来源：</strong>~/.claude/projects/*/*.jsonl，共找到 {n} 个会话文件。<br>
-        <strong>注意：</strong>这是实时原始数据，非 /insight AI 分析结果。部分字段（如目标分类、摩擦点）由启发式规则推断，可能与 facets 数据有差异。
+        <strong>定义：</strong>选定日期范围内有活动的 Claude Code CLI 会话数量。<br>
+        <strong>数据来源：</strong>~/.claude/projects/*/*.jsonl，本报告纳入 {n} 个会话文件。<br>
+        <strong>注意：</strong>这是原始 JSONL + insight-zh 中文缓存，不要求先跑官方 /insights。目标分类、摩擦点等语义字段优先用官方 facets，缺失时由 insight-zh 规则推断。
       </div>
     </details>"""
     else:
@@ -2172,7 +2254,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     <details class="ov-details">
       <summary>📐 这个数怎么算的？</summary>
       <div class="method-text">
-        <strong>定义：</strong>被 /insight 命令深度分析过的 Claude Code CLI 会话数量。<br>
+        <strong>定义：</strong>被官方 /insights 命令深度分析过的 Claude Code CLI 会话数量。<br>
         <strong>数据来源：</strong>每个 facets JSON 文件对应一个会话，共找到 {n} 个 facets 文件。<br>
         <strong>注意：</strong>这不包括 Claude App（桌面端/网页端）的会话，仅限 CLI 端。
       </div>
@@ -2181,27 +2263,27 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     <details class="ov-details">
       <summary>📐 这个数怎么算的？</summary>
       <div class="method-text">
-        <strong>定义：</strong>所有会话中你（用户）发出的消息总数。<br>
-        <strong>计算：</strong>累加每个会话的 meta.user_message_count 字段。<br>
-        <strong>不含：</strong>Claude 的回复、系统消息、工具调用结果。
+        <strong>定义：</strong>所有会话中你实际输入的文本消息总数。<br>
+        <strong>计算：</strong>从 JSONL 的 user 消息里排除 tool_result 回传、/command 包装、local-command caveat 等系统包装后累加。<br>
+        <strong>不含：</strong>Claude 的回复、工具调用结果、系统注入消息。
       </div>
     </details>"""
     ov_dur_details = f"""
     <details class="ov-details">
       <summary>📐 这个数怎么算的？</summary>
       <div class="method-text">
-        <strong>定义：</strong>所有会话从第一条消息到最后一条消息的累计时长。<br>
-        <strong>计算：</strong>累加每个会话的 meta.duration_minutes 字段 ÷ 60 = {total_dur//60} 小时。<br>
-        <strong>注意：</strong>包括你离开电脑的时间，只要会话未结束就计入。
+        <strong>定义：</strong>所有会话的活跃时长估算。<br>
+        <strong>计算：</strong>按 JSONL 相邻事件时间差累加，但单个空闲间隔最多按 15 分钟计入；总计约 {total_dur//60} 小时。<br>
+        <strong>另有：</strong>墙钟跨度保存在 meta.elapsed_duration_minutes，用于审计跨日长会话，但不作为概览时长。
       </div>
     </details>"""
     ov_commit_details = f"""
     <details class="ov-details">
       <summary>📐 这个数怎么算的？</summary>
       <div class="method-text">
-        <strong>定义：</strong>Claude 在这些会话期间帮你完成的 git push 总次数。<br>
-        <strong>计算：</strong>累加每个会话的 meta.git_pushes 字段；若旧数据没有该字段，则回退到兼容字段。<br>
-        <strong>注意：</strong>只统计会话元数据里记录到的 push，不含你自己在终端手动执行但未写回元数据的次数。
+        <strong>定义：</strong>会话项目所在 Git 仓库在对应会话时间窗口内产生的 commit 总数。<br>
+        <strong>计算：</strong>对每个会话的 project_path 找到 Git repo root，再用 git log --since/--until 统计 commit。<br>
+        <strong>注意：</strong>不区分 Claude Code、Codex、其他 AI 或你手动提交；只要底层 repo 在窗口内有 commit 就算。
       </div>
     </details>"""
 
@@ -2246,20 +2328,20 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
           {timeline_rows}
         </div>'''
 
-    # ── 新增：push 详情列表 ──
+    # ── 新增：commit 详情列表 ──
     commit_details_html = ""
     if commit_list:
         commit_rows = ""
         for c in commit_list[:20]:
             d_str = c["date"].strftime("%m-%d") if c["date"] and hasattr(c["date"], "strftime") else ""
             goal_short = c["goal"][:60] + ("…" if len(c["goal"]) > 60 else "") if c["goal"] else "(无目标)"
-            commit_rows += f'<div class="drill-row"><span class="drill-date">{d_str}</span><span class="drill-sid">{c["sid"]}</span><span>{goal_short}</span><span style="margin-left:auto;color:var(--text-dim);font-size:0.78rem;">{c["commits"]} push · {c["dur"]}分</span></div>'
+            commit_rows += f'<div class="drill-row"><span class="drill-date">{d_str}</span><span class="drill-sid">{c["sid"]}</span><span>{goal_short}</span><span style="margin-left:auto;color:var(--text-dim);font-size:0.78rem;">{c["commits"]} commit · {c["dur"]}分</span></div>'
         more_commit = ""
         if len(commit_list) > 20:
-            more_commit = f'<div class="drill-more">共 {len(commit_list)} 个有 push 的会话</div>'
+            more_commit = f'<div class="drill-more">共 {len(commit_list)} 个有 commit 的会话</div>'
         commit_details_html = f'''
         <details class="expandable" style="margin-top:16px;">
-                    <summary>查看 {len(commit_list)} 个有 push 的会话详情</summary>
+                    <summary>查看 {len(commit_list)} 个有 commit 的会话详情</summary>
           <div class="drill-list">{commit_rows}{more_commit}</div>
         </details>'''
 
@@ -3120,7 +3202,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
 <body>
 <div class="container">
   <h1>Claude Code 洞察报告</h1>
-  <div class="subtitle">{n} 个会话 · {first_date} 至 {last_date} · {total_user_msgs:,} 条消息 · {total_dur//60} 小时 · {total_commits} 次 push</div>
+  <div class="subtitle">{n} 个会话 · {first_date} 至 {last_date} · {total_user_msgs:,} 条消息 · {total_dur//60} 小时 · {total_commits}  个 commit</div>
 
   <div class="nav">
     <a href="#overview">概览</a>
@@ -3135,10 +3217,10 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
   <!-- 概览 -->
   <div class="section" id="overview">
     <div class="overview-grid">
-      <div class="ov-card"><div class="ov-num">{n}</div><div class="ov-label">会话</div><div class="ov-tooltip">被 /insight 深度分析过的 Claude Code CLI 会话数（每个 facets JSON 一个）</div>{ov_session_details}</div>
-      <div class="ov-card"><div class="ov-num">{total_user_msgs:,}</div><div class="ov-label">消息</div><div class="ov-tooltip">这些会话中你（用户）发出的消息总数，不含 Claude 的回复</div>{ov_msgs_details}</div>
-      <div class="ov-card"><div class="ov-num">{total_dur//60}h</div><div class="ov-label">时长</div><div class="ov-tooltip">这些会话从第一条消息到最后一条消息的累计时长（小时）</div>{ov_dur_details}</div>
-    <div class="ov-card"><div class="ov-num">{total_commits}</div><div class="ov-label">Push</div><div class="ov-tooltip">这些会话期间 Claude 帮你完成的 git push 总次数</div>{ov_commit_details}</div>
+      <div class="ov-card"><div class="ov-num">{n}</div><div class="ov-label">会话</div><div class="ov-tooltip">选定日期范围内有活动的 Claude Code CLI 会话数</div>{ov_session_details}</div>
+      <div class="ov-card"><div class="ov-num">{total_user_msgs:,}</div><div class="ov-label">消息</div><div class="ov-tooltip">这些会话中你实际输入的文本消息数，不含工具结果回传</div>{ov_msgs_details}</div>
+      <div class="ov-card"><div class="ov-num">{total_dur//60}h</div><div class="ov-label">活跃时长</div><div class="ov-tooltip">按相邻事件间隔估算的活跃时长，单个空闲间隔最多计 15 分钟</div>{ov_dur_details}</div>
+    <div class="ov-card"><div class="ov-num">{total_commits}</div><div class="ov-label">Commit</div><div class="ov-tooltip">这些会话项目底层 Git 仓库在对应时间窗口内产生的 git commit 总数</div>{ov_commit_details}</div>
     </div>
 
     {timeline_html}
@@ -3177,7 +3259,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
       <div class="compare-row"><span class="compare-label">Bash/Read 比</span><div><span class="compare-value" style="color:{'#ef4444' if ratio > 2 else '#22c55e'}">{ratio:.1f}:1</span><span class="compare-target">理想 &lt; 2:1</span></div></div>
       <div class="compare-row"><span class="compare-label">平均每会话时长</span><div><span class="compare-value">{total_dur//max(n,1)} 分钟</span><span class="compare-target">{'偏长' if total_dur//max(n,1) > 120 else '正常'}</span></div></div>
       <div class="compare-row"><span class="compare-label">平均每会话消息</span><div><span class="compare-value">{total_user_msgs//max(n,1)} 条</span><span class="compare-target">{'偏高' if avg_msgs > 30 else '正常'}</span></div></div>
-    <div class="compare-row"><span class="compare-label">Push 率</span><div><span class="compare-value" style="color:{'#ef4444' if (total_dur//max(total_commits,1) if total_commits else 9999) > 120 else '#22c55e'}">{total_dur//max(total_commits,1) if total_commits else '∞'} 分钟/push</span><span class="compare-target">理想 &lt; 120</span></div></div>
+    <div class="compare-row"><span class="compare-label">Commit 率</span><div><span class="compare-value" style="color:{'#ef4444' if (total_dur//max(total_commits,1) if total_commits else 9999) > 120 else '#22c55e'}">{total_dur//max(total_commits,1) if total_commits else '∞'} 分钟/commit</span><span class="compare-target">理想 &lt; 120</span></div></div>
     </div>
 
     <h3>会话类型、结果、时段</h3>
@@ -3268,7 +3350,7 @@ def main():
 
     if args.html:
         report = generate_html_report(items, translations, force_regenerate_advice=args.regen_advice)
-        path = REPORTS_DIR / f"{date.today()}.html"
+        path = REPORTS_DIR / f"{report_basename(start_d, end_d)}.html"
         path.write_text(report, encoding="utf-8")
         print(f"HTML 报告已保存：{path}")
         try:
@@ -3283,7 +3365,7 @@ def main():
         print(report)
         return
 
-    path = REPORTS_DIR / f"{date.today()}.md"
+    path = REPORTS_DIR / f"{report_basename(start_d, end_d)}.md"
     path.write_text(report, encoding="utf-8")
     print(f"报告已保存：{path}")
 
