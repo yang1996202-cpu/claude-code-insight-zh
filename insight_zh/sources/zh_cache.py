@@ -39,6 +39,7 @@ SESSION_META_ANALYZER_VERSION = _analyzer_version(
 FACET_ANALYZER_VERSION = _analyzer_version(
     "facets",
     [
+        "analysis/semantic_facets.py",
         "analysis/session_inference.py",
         "domain/session.py",
         "sources/jsonl_source.py",

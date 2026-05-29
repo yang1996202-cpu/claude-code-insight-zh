@@ -52,7 +52,7 @@ class ReportRenderingTest(unittest.TestCase):
     def setUpClass(cls):
         cls.module_globals = runpy.run_path(str(ROOT / "insight-zh.py"), run_name="not_main")
 
-    def test_generate_report_uses_push_metrics_and_goal_labels(self):
+    def test_generate_report_uses_commit_metrics_and_goal_labels(self):
         generate_report = self.module_globals["generate_report"]
 
         report = generate_report(sample_items(), translations={})
@@ -63,7 +63,7 @@ class ReportRenderingTest(unittest.TestCase):
         self.assertIn("调试与排障：1", report)
         self.assertIn("代码与实现：1", report)
 
-    def test_generate_html_report_uses_push_labels_and_rate(self):
+    def test_generate_html_report_uses_commit_labels_and_rate(self):
         generate_html_report = self.module_globals["generate_html_report"]
         generate_html_report.__globals__["generate_coaching_advice"] = lambda *args, **kwargs: []
 

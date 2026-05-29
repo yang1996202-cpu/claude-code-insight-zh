@@ -1,6 +1,7 @@
 import re
 from collections import Counter
 
+from insight_zh.analysis.semantic_facets import enhance_facet_semantics
 from insight_zh.domain.session import coerce_int
 
 
@@ -288,6 +289,7 @@ def build_legacy_report_item(session):
         "edit_targets_count": len(edit_targets),
         "write_targets_count": len(write_targets),
     }
+    facet = enhance_facet_semantics(session, facet)
 
     meta = {
         "session_id": session.session_id,
