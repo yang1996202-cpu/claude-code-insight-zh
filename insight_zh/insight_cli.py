@@ -23,12 +23,16 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 
 from insight_zh.analysis.session_inference import build_legacy_report_item, get_git_push_count
-from insight_zh.sources.session_loader import load_sessions_from_workspace
+from insight_zh.sources.facets_source import load_facet
+from insight_zh.sources.jsonl_source import iter_project_jsonl_paths, parse_jsonl_session
+from insight_zh.sources.session_loader import merge_session_sources
+from insight_zh.sources.session_meta_source import load_session_meta
+from insight_zh.sources.zh_cache import load_cached_report_item, reports_dir, write_report_item_cache
 
 CLAUDE_DIR = Path.home() / ".claude"
 FACETS_DIR = CLAUDE_DIR / "usage-data/facets"
 META_DIR = CLAUDE_DIR / "usage-data/session-meta"
-REPORTS_DIR = CLAUDE_DIR / "insight-reports"
+REPORTS_DIR = reports_dir(CLAUDE_DIR)
 REPORTS_DIR.mkdir(exist_ok=True)
 
 # ── API 配置 ──
@@ -243,10 +247,58 @@ def _build_item_from_normalized_session(session):
 
 
 def load_data_from_jsonl(start_d, end_d):
-    """通过共享 loader 读取 jsonl/meta/facet，并适配回旧报告结构。"""
+    """读取 JSONL 原始会话，并维护 insight-zh 自己的分层缓存。
+
+    缓存目录：
+      ~/.claude/usage-data-zh/session-meta/*.json
+      ~/.claude/usage-data-zh/facets/*.json
+      ~/.claude/usage-data-zh/index.json
+
+    原始 JSONL 的 mtime/size 未变化且 analyzer_version 一致时，直接复用缓存；
+    否则重新解析 JSONL，合并官方 /insights 的 usage-data，再写回中文缓存。
+    """
     items = []
-    for session in load_sessions_from_workspace(start_d, end_d, CLAUDE_DIR):
-        items.append(_build_item_from_normalized_session(session))
+    for jsonl_path in iter_project_jsonl_paths(CLAUDE_DIR):
+        cached_item = load_cached_report_item(jsonl_path, CLAUDE_DIR)
+        if cached_item:
+            item_date = cached_item.get("date")
+            if start_d and item_date and item_date < start_d:
+                continue
+            if item_date and item_date > end_d:
+                continue
+            items.append(cached_item)
+            continue
+
+        parsed = parse_jsonl_session(jsonl_path)
+        first_ts = parsed.get("first_ts")
+        last_ts = parsed.get("last_ts") or first_ts
+        if first_ts is None or not parsed.get("user_msgs"):
+            continue
+
+        session_start_date = first_ts.date()
+        session_end_date = last_ts.date() if last_ts else session_start_date
+        if start_d and session_end_date < start_d:
+            continue
+        if session_start_date > end_d:
+            continue
+
+        first_prompt = (parsed.get("first_user") or "").strip()
+        if first_prompt.startswith("<") and ">" in first_prompt:
+            continue
+
+        session_id = jsonl_path.stem
+        session = merge_session_sources(
+            session_id=session_id,
+            jsonl_path=jsonl_path,
+            parsed=parsed,
+            facet=load_facet(session_id, CLAUDE_DIR),
+            meta=load_session_meta(session_id, CLAUDE_DIR),
+        )
+        if session is None:
+            continue
+        item = _build_item_from_normalized_session(session)
+        write_report_item_cache(item, jsonl_path, CLAUDE_DIR)
+        items.append(item)
 
     items.sort(key=lambda x: x["date"] or date.min, reverse=True)
     return items
@@ -1317,6 +1369,9 @@ def generate_coaching_advice(stats_dict, translations=None, force_regenerate=Fal
             return cached
         except Exception:
             pass
+
+    if not API_KEY:
+        return []
 
     # 构造证据材料
     s = stats_dict

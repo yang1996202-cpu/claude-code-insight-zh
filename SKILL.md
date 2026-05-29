@@ -7,7 +7,7 @@ description: |
   /weekly  — 深度周报（LLM 理解，看本周趋势和根因）
   /monthly — 深度月报（LLM 理解，看长期进化）
 
-  数据同源：都基于 ~/.claude/projects/*/*.jsonl 会话数据。
+  数据同源：都基于 ~/.claude/projects/*/*.jsonl 会话数据，并维护 ~/.claude/usage-data-zh/ 中文缓存。
   触发词：insight, 洞察, 报告, 复盘, 日报, 周报, 月报, daily, weekly
 allowed-tools:
   - Bash
@@ -73,10 +73,11 @@ python3 ~/projects/claude-code-insight-zh/insight-zh.py 7 --print-only
 python3 ~/projects/claude-code-insight-zh/insight-zh.py 7 --no-translate --print-only
 ```
 
-产出：`~/.claude/insight-reports/YYYY-MM-DD.html`
+产出：`~/.claude/usage-data-zh/reports/YYYY-MM-DD.html`
 
 特点：
 - 几分钟，LLM 驱动，深度理解上下文
+- 借鉴 Claude Code /insights 的分层缓存：JSONL 原始数据 -> usage-data-zh/session-meta -> usage-data-zh/facets -> HTML/Markdown 报告
 - 输出：工作模式画像、坏习惯分析、反常信号、改进建议
 - 支持 HTML 可视化报告
 
@@ -129,8 +130,9 @@ python3 ~/projects/claude-code-insight-zh/insight-zh.py 7 --no-translate --print
 ## 注意事项
 
 - 所有脚本基于 `~/.claude/projects/*/*.jsonl` 原始会话数据
+- weekly/monthly 会把已分析结果缓存到 `~/.claude/usage-data-zh/`，缓存带自动计算的 analyzer version 和源文件 mtime/size；原始 JSONL、官方 `/insights` usage-data 或相关分析代码更新后会自动失效重算
 - daily 模式不调用 LLM，weekly/monthly 可能调用 Kimi API 翻译
 - 首次运行 weekly/monthly 可能需要翻译（有缓存后会快）
 - daily 报告路径：`~/.claude/daily-reports/`
-- weekly/monthly 报告路径：`~/.claude/insight-reports/`
+- weekly/monthly 报告路径：`~/.claude/usage-data-zh/reports/`
 - 深度建议缓存按日期范围 + 摘要 hash 分桶，不再按自然日共享

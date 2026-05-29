@@ -87,6 +87,7 @@ export INSIGHT_API_MODEL="kimi-for-coding"
 ```
 ~/.claude/projects/*/*.jsonl        # 原始会话记录（主要数据源）
 ~/.claude/usage-data/facets/        # 会话分析 facets（JSON）
+~/.claude/usage-data-zh/            # insight-zh 自己的中文缓存层
 ```
 
 > 只包含 Claude Code CLI 的会话，不含 Claude App（桌面端/网页端）。
@@ -151,7 +152,7 @@ python3 insight-zh.py 7 --no-translate --print-only
 python3 insight-zh.py 2026-04-01 2026-05-01 --html --save
 ```
 
-产出：`~/.claude/insight-reports/YYYY-MM-DD.html`
+产出：`~/.claude/usage-data-zh/reports/YYYY-MM-DD.html`
 
 ### 开发与测试
 
@@ -210,9 +211,15 @@ alias insight='python3 /path/to/insight-zh.py'
 
 ## 缓存机制
 
-- 翻译缓存：`~/.claude/insight-reports/.translation-cache.json`
-- 建议缓存：`~/.claude/insight-reports/.advice-cache-<first_date>-<last_date>-<digest>.json`
+- 中文会话缓存：`~/.claude/usage-data-zh/session-meta/*.json`
+- 中文 facets 缓存：`~/.claude/usage-data-zh/facets/*.json`
+- 中文缓存索引：`~/.claude/usage-data-zh/index.json`
+- 中文报告产物：`~/.claude/usage-data-zh/reports/YYYY-MM-DD.html`
+- 翻译缓存：`~/.claude/usage-data-zh/reports/.translation-cache.json`
+- 建议缓存：`~/.claude/usage-data-zh/reports/.advice-cache-<first_date>-<last_date>-<digest>.json`
 - 首次运行 weekly/monthly 需要翻译（会调用 LLM API），后续有缓存会快很多
+
+`usage-data-zh` 借鉴 Claude Code 内置 `/insights` 的分层逻辑：先从 `~/.claude/projects/*/*.jsonl` 解析出确定性的 session-meta，再把中文启发式 / 官方 facets 合并成 facets 缓存，最后聚合渲染 HTML/Markdown 报告。缓存会记录原始 JSONL 以及官方 `usage-data/session-meta`、`usage-data/facets` 的 mtime/size 和 analyzer version；任一来源变化或分析器版本变化时，会自动重新生成对应 session 的中文缓存。analyzer version 由相关分析代码内容自动计算，不需要手动改缓存目录名。
 
 其中建议缓存不是按自然日，而是按日期范围和统计摘要分桶，避免不同时间范围误复用同一份深度建议。
 
