@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Claude Code 中文洞察报告 — 从 facets + session-meta 生成，绕过 /insight 的英文模板
-支持：LLM 翻译层 + 定性分析
+支持：本地规则分析 + 可选外部 LLM 增强
 
 用法：
   insight-zh                   全部历史数据（默认）
@@ -9,7 +9,8 @@ Claude Code 中文洞察报告 — 从 facets + session-meta 生成，绕过 /in
   insight-zh 2026-04-01 2026-05-01   指定日期范围
   insight-zh --save            输出到文件
   insight-zh --print-only      只输出 stdout
-  insight-zh --no-translate    跳过 LLM 翻译（纯规则）
+  insight-zh --llm-advice      使用外部 LLM 生成建议（需要 INSIGHT_API_KEY）
+  insight-zh --translate       使用外部 LLM 翻译官方 facets 英文文本（需要 INSIGHT_API_KEY）
 """
 import argparse
 import hashlib
@@ -36,9 +37,10 @@ META_DIR = CLAUDE_DIR / "usage-data/session-meta"
 REPORTS_DIR = reports_dir(CLAUDE_DIR)
 REPORTS_DIR.mkdir(exist_ok=True)
 
-# ── API 配置 ──
-# 支持任意兼容 Anthropic SDK 的 API（Kimi、DeepSeek、OpenAI 等）
-# 使用前设置环境变量：export INSIGHT_API_KEY="sk-..."
+# ── 可选外部 LLM 配置 ──
+# 默认报告不需要 API key，也不会主动调用外部模型。
+# 只有显式传入 --llm-advice 或 --translate 时才会读取这些环境变量。
+# 支持任意兼容 Anthropic SDK 的 API（Kimi、DeepSeek、OpenAI 等）。
 # 可选：export INSIGHT_API_BASE="https://api.kimi.com/coding/"
 # 可选：export INSIGHT_API_MODEL="kimi-for-coding"
 API_BASE_URL = os.environ.get("INSIGHT_API_BASE", "https://api.kimi.com/coding/")
@@ -175,7 +177,9 @@ def parse_args():
     p.add_argument("--all", action="store_true")
     p.add_argument("--save", action="store_true")
     p.add_argument("--print-only", action="store_true")
-    p.add_argument("--no-translate", action="store_true", help="跳过 LLM 翻译")
+    p.add_argument("--translate", action="store_true", help="使用外部 LLM 翻译官方 facets 英文文本（需要 INSIGHT_API_KEY）")
+    p.add_argument("--no-translate", action="store_true", help="兼容旧参数：保持不翻译")
+    p.add_argument("--llm-advice", action="store_true", help="使用外部 LLM 生成深度建议（需要 INSIGHT_API_KEY）")
     p.add_argument("--html", action="store_true", help="生成 HTML 可视化报告")
     p.add_argument("--regen-advice", action="store_true", help="强制重新生成深度建议（不用今天的缓存）")
     p.add_argument("-h", "--help", action="store_true")
@@ -343,6 +347,9 @@ def translate_batch(texts, max_batch=30):
     """用 Kimi API 批量翻译英文文本。返回 {原文: 译文} 字典。支持缓存。"""
     if not texts:
         return {}
+    if not API_KEY:
+        print("(未设置 INSIGHT_API_KEY，跳过外部 LLM 翻译)", file=sys.stderr)
+        return {t: t for t in texts}
 
     # 加载缓存
     cache = load_translation_cache()
@@ -1392,11 +1399,21 @@ def get_advice_cache_path(stats_dict):
     return REPORTS_DIR / f".advice-cache-{first_date}-{last_date}-{digest}.json"
 
 
-def generate_coaching_advice(stats_dict, translations=None, force_regenerate=False):
-    """调用 LLM 生成 Karpathy 风格的深度教练建议（基于证据、多维度、可执行）。
-    支持按报告范围缓存：同一份统计结果重复跑不再调 LLM。"""
+def generate_coaching_advice(stats_dict, translations=None, force_regenerate=False, use_external_llm=False):
+    """Generate coaching advice.
+
+    Default path is local rule-based advice so the report never requires an API
+    key. External LLM advice is opt-in via --llm-advice.
+    """
     if translations is None:
         translations = {}
+
+    if not use_external_llm:
+        return generate_rule_coaching_advice(stats_dict)
+
+    if not API_KEY:
+        print("  未设置 INSIGHT_API_KEY，使用本地规则建议", file=sys.stderr)
+        return generate_rule_coaching_advice(stats_dict)
 
     advice_cache_file = get_advice_cache_path(stats_dict)
     if not force_regenerate and advice_cache_file.exists():
@@ -1406,9 +1423,6 @@ def generate_coaching_advice(stats_dict, translations=None, force_regenerate=Fal
             return cached
         except Exception:
             pass
-
-    if not API_KEY:
-        return generate_rule_coaching_advice(stats_dict)
 
     # 构造证据材料
     s = stats_dict
@@ -1557,7 +1571,7 @@ def generate_coaching_advice(stats_dict, translations=None, force_regenerate=Fal
 
 
 def generate_rule_coaching_advice(stats_dict):
-    """Fallback coaching cards when no LLM API key is configured."""
+    """Local rule-based coaching cards used by default."""
     s = stats_dict
     advice = []
     bash = s.get("bash", 0)
@@ -1857,7 +1871,7 @@ def build_insights_like_sections(session_records, totals):
     }
 
 
-def generate_html_report(items, translations=None, force_regenerate_advice=False):
+def generate_html_report(items, translations=None, force_regenerate_advice=False, use_external_llm_advice=False):
     if not items:
         return "<html><body><h1>无数据</h1></body></html>"
 
@@ -2345,7 +2359,12 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         "outcomes": outcomes,
         "habits": habits,
     }
-    deep_advice = generate_coaching_advice(stats_dict, translations, force_regenerate=force_regenerate_advice)
+    deep_advice = generate_coaching_advice(
+        stats_dict,
+        translations,
+        force_regenerate=force_regenerate_advice,
+        use_external_llm=use_external_llm_advice,
+    )
     insights_sections = build_insights_like_sections(session_records, stats_dict)
 
     # ── 自动反常检测 ──
@@ -3716,7 +3735,7 @@ def main():
         source_label = "facets"
 
     translations = {}
-    if not args.no_translate and items and source_label == "facets":
+    if args.translate and not args.no_translate and items and source_label == "facets":
         print(f"收集到 {len(items)} 个会话的 facets 数据，准备翻译...", file=sys.stderr)
         texts = collect_texts_to_translate(items)
         print(f"需要翻译的 unique 文本：{len(texts)} 条", file=sys.stderr)
@@ -3725,7 +3744,12 @@ def main():
             print(f"翻译完成", file=sys.stderr)
 
     if args.html:
-        report = generate_html_report(items, translations, force_regenerate_advice=args.regen_advice)
+        report = generate_html_report(
+            items,
+            translations,
+            force_regenerate_advice=args.regen_advice,
+            use_external_llm_advice=args.llm_advice,
+        )
         path = REPORTS_DIR / f"{report_basename(start_d, end_d)}.html"
         path.write_text(report, encoding="utf-8")
         print(f"HTML 报告已保存：{path}")

@@ -83,6 +83,37 @@ class ReportRenderingTest(unittest.TestCase):
         self.assertIn("语义来源", html)
         self.assertNotIn("Push 率", html)
 
+    def test_generate_coaching_advice_defaults_to_local_rules(self):
+        generate_coaching_advice = self.module_globals["generate_coaching_advice"]
+        stats = {
+            "first_date": date(2026, 5, 20),
+            "last_date": date(2026, 5, 20),
+            "n": 1,
+            "total_dur": 240,
+            "total_user_msgs": 8,
+            "total_commits": 0,
+            "bash": 20,
+            "read": 4,
+            "edit": 3,
+            "write": 1,
+            "interruptions": 0,
+            "morning": 1,
+            "afternoon": 0,
+            "night": 0,
+            "midnight": 0,
+            "frictions": {},
+            "friction_details": [],
+            "goals": {},
+            "outcomes": {},
+            "habits": [],
+        }
+
+        self.module_globals["API_KEY"] = "fake-key-that-should-not-be-used"
+        advice = generate_coaching_advice(stats, use_external_llm=False)
+
+        self.assertTrue(advice)
+        self.assertIn("title", advice[0])
+
 
 if __name__ == "__main__":
     unittest.main()

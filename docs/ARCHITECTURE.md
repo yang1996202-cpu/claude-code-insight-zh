@@ -93,9 +93,9 @@ The important design point: cache names do not change manually for each analysis
 
 ## LLM boundary
 
-LLM usage is enhancement only:
+External LLM usage is enhancement only and is opt-in:
 
-- translation of English official fields;
-- optional deep coaching advice when `INSIGHT_API_KEY` is available.
+- `--translate` translates English official fields when configured;
+- `--llm-advice` generates external-LLM coaching advice when configured.
 
-LLM output is not used as the source of factual counters such as session count, message count, duration, or git activity.
+Default reports do not require an API key and do not call external models, even if `INSIGHT_API_KEY` exists in the environment. Local rule-based advice is always available. External LLM output is not used as the source of factual counters such as session count, message count, duration, or git activity.

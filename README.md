@@ -78,15 +78,25 @@ cd claude-code-insight-zh
 pip install -r requirements.txt
 ```
 
-可选：配置 LLM API，用于翻译和深度建议。
+默认报告不需要 API key，也不会调用外部模型。事实统计、语义 fallback、深度建议卡片都可以本地生成。
+
+可选：如果你明确想用外部 LLM 增强建议或翻译官方 facets 英文文本，再安装 SDK 并配置 API。
 
 ```bash
+pip install "anthropic>=0.40.0"
 export INSIGHT_API_KEY="sk-your-key"
 export INSIGHT_API_BASE="https://api.kimi.com/coding/"
 export INSIGHT_API_MODEL="kimi-for-coding"
 ```
 
-没有 `INSIGHT_API_KEY` 时，报告仍会生成，只跳过 LLM 深度建议。
+使用外部 LLM 时必须显式加参数：
+
+```bash
+python3 insight-zh.py 7 --html --save --llm-advice
+python3 insight-zh.py 7 --html --save --translate
+```
+
+没有这些参数时，即使环境里存在 `INSIGHT_API_KEY`，也不会调用外部模型。
 
 ## 用法
 

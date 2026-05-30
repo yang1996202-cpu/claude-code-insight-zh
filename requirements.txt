@@ -1,4 +1,6 @@
 # 核心依赖（Python 3.9+）
-# insight-zh.py 的 LLM 翻译层和深度建议需要 anthropic SDK
-# 支持任意兼容 Anthropic API 格式的服务（Kimi、DeepSeek、OpenAI 等）
-anthropic>=0.40.0
+# 默认报告只使用 Python 标准库，不需要安装第三方包。
+#
+# 可选：如果要使用 --llm-advice 或 --translate，需要自行安装：
+#   pip install anthropic>=0.40.0
+# 并配置 INSIGHT_API_KEY / INSIGHT_API_BASE / INSIGHT_API_MODEL。
