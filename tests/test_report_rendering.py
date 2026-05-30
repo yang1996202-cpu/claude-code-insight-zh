@@ -77,9 +77,10 @@ class ReportRenderingTest(unittest.TestCase):
         self.assertIn("调试与排障", html)
         self.assertEqual(html.count("<h2>画室观察笔记</h2>"), 1)
         self.assertIn("明天可以试的", html)
-        self.assertIn("你真正投入的工作流", html)
-        self.assertIn("你怎么使用 Claude Code", html)
-        self.assertIn("可复制到 CLAUDE.md 的协作规则", html)
+        self.assertIn("主要工作流", html)
+        self.assertIn("使用方式画像", html)
+        self.assertIn("可复用的协作规则", html)
+        self.assertIn("语义来源", html)
         self.assertNotIn("Push 率", html)
 
 

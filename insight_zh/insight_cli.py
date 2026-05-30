@@ -1666,13 +1666,13 @@ def _theme_bucket(raw_categories, goal, summary):
         or any(k in text for k in ["claude code", "insight", "usage-data", "facets", "skill"])
         or any(k in text for k in ["缓存", "中文报告", "分析器"])
     ):
-        return "Claude Code 工具链与分析系统"
+        return "AI 编程工具链与分析系统"
     if "内容创作" in big_categories or any(k in raw_text for k in ["publish", "wechat", "article", "content", "illustration"]):
-        return "内容发布与写作流水线"
+        return "内容生产与发布流水线"
     if any(k in text for k in ["codepilot", "client", "ui", "model", "display", "sdk", "electron"]):
-        return "客户端配置与 UI 排障"
+        return "应用配置与 UI 排障"
     if any(k in text for k in ["macos", "pmset", "caffeinate", "sleep", "lid", "power"]):
-        return "macOS 与本地环境自动化"
+        return "本地环境与系统自动化"
     if any(k in text for k in ["feishu", "lark", "knowledge", "memory", "obsidian", "nowledge", "文档", "知识"]):
         return "知识管理与外部集成"
     if "Git 操作" in big_categories or any(k in raw_text for k in ["github", "git", "repo", "commit", "push"]):
@@ -1694,13 +1694,13 @@ def _topic_reason(bucket, records):
     top_outcome = OUTCOME_MAP.get(outcomes.most_common(1)[0][0], outcomes.most_common(1)[0][0]) if outcomes else "未知"
     sample = _truncate(records[0]["summary"] or records[0]["goal"], 160) if records else ""
 
-    if bucket == "Claude Code 工具链与分析系统":
-        return f"你在把 Claude Code 当成可改造的平台：围绕报告、skill、缓存、工作流做了 {sessions} 个会话，工具调用里 Bash {bash} 次、Edit/Write {edit_write} 次，说明它不是聊天问答，而是本地系统工程。代表会话：{sample}"
-    if bucket == "内容发布与写作流水线":
+    if bucket == "AI 编程工具链与分析系统":
+        return f"这类会话把 AI 编程工具当成可改造的平台：围绕报告、skill、缓存、工作流做了 {sessions} 个会话，工具调用里 Bash {bash} 次、Edit/Write {edit_write} 次，说明它不是聊天问答，而是本地系统工程。代表会话：{sample}"
+    if bucket == "内容生产与发布流水线":
         return f"这是可复用的内容生产线：{sessions} 个会话集中在文章、HTML、图片或发布链路，Read {read} 次、Edit/Write {edit_write} 次。重点不是一次写完，而是把每次摩擦沉淀成流水线能力。代表会话：{sample}"
-    if bucket == "客户端配置与 UI 排障":
+    if bucket == "应用配置与 UI 排障":
         return f"这类会话集中在 UI 显示、配置文件和真实运行行为的分层排查，共 {sessions} 个。结果多为 {top_outcome}，通常卡在第三方客户端限制或显示层/运行层混淆。代表会话：{sample}"
-    if bucket == "macOS 与本地环境自动化":
+    if bucket == "本地环境与系统自动化":
         return f"这类工作是典型本机自动化：{sessions} 个会话围绕系统状态、命令环境和长期运行可靠性。Bash {bash} 次说明大部分成本在验证环境事实。代表会话：{sample}"
     if bucket == "知识管理与外部集成":
         return f"这类会话在处理知识持久化、外部系统接入和可检索记录，共 {sessions} 个。它的难点不是写代码，而是权限、数据边界和工具能力是否真实可用。代表会话：{sample}"
@@ -1739,8 +1739,8 @@ def build_insights_like_sections(session_records, totals):
 
     themes_html = f"""
 <div class="section" id="themes">
-  <h2>你真正投入的工作流</h2>
-  <p class="section-hint">这一段按官方 /insights 的思路做：不是展示指标，而是把多个会话归并成长期推进的工作流。</p>
+  <h2>主要工作流</h2>
+  <p class="section-hint">这一段按语义层字段聚合多个会话，展示长期推进的工作流，而不是重复罗列工具指标。</p>
   <div class="insight-stack">{theme_cards}</div>
 </div>"""
 
@@ -1775,10 +1775,10 @@ def build_insights_like_sections(session_records, totals):
 
     behavior_html = f"""
 <div class="section" id="behavior">
-  <h2>你怎么使用 Claude Code</h2>
+  <h2>使用方式画像</h2>
   <div class="narrative narrative-large">
     {''.join(f'<p>{_escape_html(bit)}</p>' for bit in behavior_bits)}
-    <div class="key-insight">核心画像：你不是把 Claude Code 当聊天机器人，而是当一个可被纠错、可被改造、可持续沉淀工具链的执行环境。</div>
+    <div class="key-insight">核心画像：这类使用更接近“可验证、可纠错、可沉淀的执行环境”，而不是一次性聊天问答。</div>
   </div>
 </div>"""
 
@@ -1820,7 +1820,7 @@ def build_insights_like_sections(session_records, totals):
     playbook_items = []
     if frictions.get("wrong_approach", 0) or frictions.get("misunderstood_request", 0):
         playbook_items.append((
-            "先验事实再方案",
+            "事实先于方案",
             "任何数量、路径、工具能力、系统状态，先用命令验证再下结论。没有验证就只能写“推测”。",
         ))
     if ratio > 2:
@@ -1843,7 +1843,7 @@ def build_insights_like_sections(session_records, totals):
 
     playbook_html = f"""
 <div class="section" id="playbook">
-  <h2>可复制到 CLAUDE.md 的协作规则</h2>
+  <h2>可复用的协作规则</h2>
   <div class="insight-stack">
     {''.join(f'<div class="playbook-item"><strong>{_escape_html(title)}</strong><p>{_escape_html(body)}</p></div>' for title, body in playbook_items[:5])}
   </div>
@@ -1897,10 +1897,17 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     outcome_sessions = {}    # 反向索引：达成度 → [(date, goal, sid), ...]
     hour_segment_sessions = {}  # 反向索引：时段 → [(date, goal, sid), ...]
     session_records = []
+    semantic_sources = Counter()
 
     for it in items:
         m = it["meta"]
         f = it["facet"]
+        semantic_source = "insight-zh heuristic"
+        if f.get("semantic_confidence") == "official" or f.get("_source") == "jsonl+facet":
+            semantic_source = "official insights"
+        elif f.get("semantic_confidence") == "llm" or str(f.get("_semantic_source", "")).startswith("insight-zh-semantic-v2"):
+            semantic_source = "insight-zh LLM"
+        semantic_sources[semantic_source] += 1
         total_user_msgs += m.get("user_message_count", 0)
         total_assist_msgs += m.get("assistant_message_count", 0)
         total_dur += m.get("duration_minutes", 0)
@@ -2536,6 +2543,15 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         <strong>定义：</strong>会话项目所在 Git 仓库在对应会话时间窗口内产生的 commit 总数。<br>
         <strong>计算：</strong>对每个会话的 project_path 找到 Git repo root，再用 git log --since/--until 统计 commit。<br>
         <strong>注意：</strong>不区分 Claude Code、Codex、其他 AI 或你手动提交；只要底层 repo 在窗口内有 commit 就算。
+      </div>
+    </details>"""
+    semantic_source_details = f"""
+    <details class="semantic-source-details">
+      <summary>语义来源</summary>
+      <div class="method-text">
+        <strong>事实指标：</strong>会话数、消息数、时长、工具调用、commit 均来自本地 JSONL 与 git log。<br>
+        <strong>语义字段：</strong>{semantic_sources.get("official insights", 0)} 个会话来自官方 /insights facets，{semantic_sources.get("insight-zh LLM", 0)} 个会话来自 insight-zh LLM，{semantic_sources.get("insight-zh heuristic", 0)} 个会话来自 insight-zh 规则推断。<br>
+        <strong>说明：</strong>语义字段包括目标、摘要、达成度、摩擦点、成功因素和工作流聚合；规则推断可用但深度低于逐会话 LLM 或官方 facets。
       </div>
     </details>"""
 
@@ -3393,6 +3409,37 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     background: #f8fafc;
     border-radius: 6px;
   }}
+  .semantic-source-details {{
+    margin-top: 16px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+  }}
+  .semantic-source-details summary {{
+    cursor: pointer;
+    color: var(--accent);
+    font-size: 0.9rem;
+    font-weight: 600;
+    list-style: none;
+    user-select: none;
+  }}
+  .semantic-source-details summary::-webkit-details-marker {{ display: none; }}
+  .semantic-source-details summary::before {{
+    content: "▶ ";
+    font-size: 0.7rem;
+    margin-right: 4px;
+  }}
+  .semantic-source-details[open] summary::before {{ content: "▼ "; }}
+  .semantic-source-details .method-text {{
+    font-size: 0.82rem;
+    color: #475569;
+    line-height: 1.6;
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: #f8fafc;
+    border-radius: 6px;
+  }}
 
   /* 时间分布图 */
   .timeline-chart {{
@@ -3544,6 +3591,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     <div class="ov-card"><div class="ov-num">{total_commits}</div><div class="ov-label">Commit</div><div class="ov-tooltip">这些会话项目底层 Git 仓库在对应时间窗口内产生的 git commit 总数</div>{ov_commit_details}</div>
     </div>
 
+    {semantic_source_details}
     {timeline_html}
     {commit_details_html}
 
