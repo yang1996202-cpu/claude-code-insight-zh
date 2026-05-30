@@ -24,6 +24,7 @@ from collections import Counter
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
+from insight_zh.analysis.report_lens import DEFAULT_REPORT_LENS, get_report_lens
 from insight_zh.analysis.session_inference import build_legacy_report_item, get_git_push_count as get_git_commit_count
 from insight_zh.sources.facets_source import load_facet
 from insight_zh.sources.jsonl_source import iter_project_jsonl_paths, parse_jsonl_session
@@ -180,6 +181,7 @@ def parse_args():
     p.add_argument("--translate", action="store_true", help="使用外部 LLM 翻译官方 facets 英文文本（需要 INSIGHT_API_KEY）")
     p.add_argument("--no-translate", action="store_true", help="兼容旧参数：保持不翻译")
     p.add_argument("--llm-advice", action="store_true", help="使用外部 LLM 生成深度建议（需要 INSIGHT_API_KEY）")
+    p.add_argument("--lens", default="", help="报告分析镜头，默认 workflow_behavior")
     p.add_argument("--html", action="store_true", help="生成 HTML 可视化报告")
     p.add_argument("--regen-advice", action="store_true", help="强制重新生成深度建议（不用今天的缓存）")
     p.add_argument("-h", "--help", action="store_true")
@@ -1677,38 +1679,23 @@ def _truncate(value, limit=120):
     return value[: limit - 1].rstrip() + "…"
 
 
-def _theme_bucket(raw_categories, goal, summary):
+def _theme_bucket(raw_categories, goal, summary, lens=DEFAULT_REPORT_LENS):
     raw_categories = list(raw_categories or [])
     big_categories = {classify_goal(cat) for cat in raw_categories}
     raw_text = " ".join(raw_categories).lower()
     text = " ".join(raw_categories + [goal or "", summary or ""]).lower()
 
-    if (
-        "Skill 系统管理" in big_categories
-        or "系统管理" in big_categories
-        or "工具探索" in big_categories
-        or any(k in text for k in ["claude code", "insight", "usage-data", "facets", "skill"])
-        or any(k in text for k in ["缓存", "中文报告", "分析器"])
-    ):
-        return "AI 编程工具链与分析系统"
-    if "内容创作" in big_categories or any(k in raw_text for k in ["publish", "wechat", "article", "content", "illustration"]):
-        return "内容生产与发布流水线"
-    if any(k in text for k in ["codepilot", "client", "ui", "model", "display", "sdk", "electron"]):
-        return "应用配置与 UI 排障"
-    if any(k in text for k in ["macos", "pmset", "caffeinate", "sleep", "lid", "power"]):
-        return "本地环境与系统自动化"
-    if any(k in text for k in ["feishu", "lark", "knowledge", "memory", "obsidian", "nowledge", "文档", "知识"]):
-        return "知识管理与外部集成"
-    if "Git 操作" in big_categories or any(k in raw_text for k in ["github", "git", "repo", "commit", "push"]):
-        return "GitHub 与开源交付"
-    if "调试与排障" in big_categories or any(k in raw_text for k in ["debug", "bug", "fix"]):
-        return "代码修复与调试"
-    if "代码与实现" in big_categories:
-        return "代码修复与调试"
-    return "临时问答与探索"
+    for rule in lens.theme_rules:
+        if any(category in big_categories for category in rule.big_categories):
+            return rule.name
+        if any(keyword in raw_text for keyword in rule.raw_keywords):
+            return rule.name
+        if any(keyword in text for keyword in rule.text_keywords):
+            return rule.name
+    return lens.fallback_theme
 
 
-def _topic_reason(bucket, records):
+def _topic_reason(bucket, records, lens=DEFAULT_REPORT_LENS):
     sessions = len(records)
     bash = sum(r["bash"] for r in records)
     read = sum(r["read"] for r in records)
@@ -1718,24 +1705,22 @@ def _topic_reason(bucket, records):
     top_outcome = OUTCOME_MAP.get(outcomes.most_common(1)[0][0], outcomes.most_common(1)[0][0]) if outcomes else "未知"
     sample = _truncate(records[0]["summary"] or records[0]["goal"], 160) if records else ""
 
-    if bucket == "AI 编程工具链与分析系统":
-        return f"这类会话把 AI 编程工具当成可改造的平台：围绕报告、skill、缓存、工作流做了 {sessions} 个会话，工具调用里 Bash {bash} 次、Edit/Write {edit_write} 次，说明它不是聊天问答，而是本地系统工程。代表会话：{sample}"
-    if bucket == "内容生产与发布流水线":
-        return f"这是可复用的内容生产线：{sessions} 个会话集中在文章、HTML、图片或发布链路，Read {read} 次、Edit/Write {edit_write} 次。重点不是一次写完，而是把每次摩擦沉淀成流水线能力。代表会话：{sample}"
-    if bucket == "应用配置与 UI 排障":
-        return f"这类会话集中在 UI 显示、配置文件和真实运行行为的分层排查，共 {sessions} 个。结果多为 {top_outcome}，通常卡在第三方客户端限制或显示层/运行层混淆。代表会话：{sample}"
-    if bucket == "本地环境与系统自动化":
-        return f"这类工作是典型本机自动化：{sessions} 个会话围绕系统状态、命令环境和长期运行可靠性。Bash {bash} 次说明大部分成本在验证环境事实。代表会话：{sample}"
-    if bucket == "知识管理与外部集成":
-        return f"这类会话在处理知识持久化、外部系统接入和可检索记录，共 {sessions} 个。它的难点不是写代码，而是权限、数据边界和工具能力是否真实可用。代表会话：{sample}"
-    if bucket == "GitHub 与开源交付":
-        return f"这类会话最终要落到仓库、README、commit 或 push。共 {sessions} 个会话、{commits} 个 commit，重点是把个人问题包装成可复用资产。代表会话：{sample}"
-    if bucket == "代码修复与调试":
-        return f"这类会话集中在 bug、测试和修复，共 {sessions} 个，Bash {bash} 次、Read {read} 次、Edit/Write {edit_write} 次。它最需要的是先定位再改，不然容易变成命令试错。代表会话：{sample}"
+    values = {
+        "sessions": sessions,
+        "bash": bash,
+        "read": read,
+        "edit_write": edit_write,
+        "commits": commits,
+        "top_outcome": top_outcome,
+        "sample": sample,
+    }
+    for rule in lens.theme_rules:
+        if rule.name == bucket and rule.reason_template:
+            return rule.reason_template.format(**values)
     return f"这类是低成本探索或临时问答，共 {sessions} 个。它们不一定要沉淀，但如果同一主题反复出现，就应该升级成明确项目。代表会话：{sample}"
 
 
-def build_insights_like_sections(session_records, totals):
+def build_insights_like_sections(session_records, totals, lens=DEFAULT_REPORT_LENS):
     if not session_records:
         return {
             "themes_html": "",
@@ -1746,12 +1731,12 @@ def build_insights_like_sections(session_records, totals):
 
     theme_records = {}
     for record in session_records:
-        bucket = _theme_bucket(record["raw_categories"], record["goal"], record["summary"])
+        bucket = _theme_bucket(record["raw_categories"], record["goal"], record["summary"], lens)
         theme_records.setdefault(bucket, []).append(record)
 
     theme_cards = ""
     for bucket, records in sorted(theme_records.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:5]:
-        reason = _topic_reason(bucket, records)
+        reason = _topic_reason(bucket, records, lens)
         sessions = len(records)
         commits = sum(r["commits"] for r in records)
         msg_count = sum(r["user_messages"] for r in records)
@@ -1763,8 +1748,8 @@ def build_insights_like_sections(session_records, totals):
 
     themes_html = f"""
 <div class="section" id="themes">
-  <h2>主要工作流</h2>
-  <p class="section-hint">这一段按语义层字段聚合多个会话，展示长期推进的工作流，而不是重复罗列工具指标。</p>
+  <h2>{_escape_html(lens.themes_title)}</h2>
+  <p class="section-hint">{_escape_html(lens.themes_hint)}</p>
   <div class="insight-stack">{theme_cards}</div>
 </div>"""
 
@@ -1799,10 +1784,10 @@ def build_insights_like_sections(session_records, totals):
 
     behavior_html = f"""
 <div class="section" id="behavior">
-  <h2>使用方式画像</h2>
+  <h2>{_escape_html(lens.behavior_title)}</h2>
   <div class="narrative narrative-large">
     {''.join(f'<p>{_escape_html(bit)}</p>' for bit in behavior_bits)}
-    <div class="key-insight">核心画像：这类使用更接近“可验证、可纠错、可沉淀的执行环境”，而不是一次性聊天问答。</div>
+    <div class="key-insight">{_escape_html(lens.behavior_key_insight)}</div>
   </div>
 </div>"""
 
@@ -1836,38 +1821,26 @@ def build_insights_like_sections(session_records, totals):
 
     friction_story_html = f"""
 <div class="section" id="friction-story">
-  <h2>反复出问题的地方</h2>
-  <p class="section-hint">这一段不再只列摩擦类型，而是解释这些摩擦为什么会反复发生。</p>
+  <h2>{_escape_html(lens.friction_title)}</h2>
+  <p class="section-hint">{_escape_html(lens.friction_hint)}</p>
   <div class="insight-stack">{friction_cards}</div>
 </div>""" if friction_cards else ""
 
     playbook_items = []
     if frictions.get("wrong_approach", 0) or frictions.get("misunderstood_request", 0):
-        playbook_items.append((
-            "事实先于方案",
-            "任何数量、路径、工具能力、系统状态，先用命令验证再下结论。没有验证就只能写“推测”。",
-        ))
+        playbook_items.append(lens.playbook_rules["verify_first"])
     if ratio > 2:
-        playbook_items.append((
-            "限制 Bash 探索",
-            "连续 5 个 Bash 后暂停，要求 Claude 输出当前假设、已排除项、下一步要读哪个文件。",
-        ))
+        playbook_items.append(lens.playbook_rules["limit_bash"])
     if commits == 0 or total_dur / max(commits, 1) > 120:
-        playbook_items.append((
-            "把 commit 当作检查点",
-            "超过 60-90 分钟的会话必须留下 wip commit 或决策记录；后面可以 squash，但过程不能消失。",
-        ))
+        playbook_items.append(lens.playbook_rules["commit_checkpoint"])
     if avg_msgs < 15:
-        playbook_items.append((
-            "开场补三行边界",
-            "目标、不要做什么、完成标准。这样不会阻止探索，但能减少中途纠偏。",
-        ))
+        playbook_items.append(lens.playbook_rules["opening_scope"])
     if not playbook_items:
-        playbook_items.append(("保持趋势观察", "当前没有明显重复红灯，继续观察同一指标是否连续恶化三天。"))
+        playbook_items.append(lens.playbook_rules["watch_trends"])
 
     playbook_html = f"""
 <div class="section" id="playbook">
-  <h2>可复用的协作规则</h2>
+  <h2>{_escape_html(lens.playbook_title)}</h2>
   <div class="insight-stack">
     {''.join(f'<div class="playbook-item"><strong>{_escape_html(title)}</strong><p>{_escape_html(body)}</p></div>' for title, body in playbook_items[:5])}
   </div>
@@ -1881,12 +1854,19 @@ def build_insights_like_sections(session_records, totals):
     }
 
 
-def generate_html_report(items, translations=None, force_regenerate_advice=False, use_external_llm_advice=False):
+def generate_html_report(
+    items,
+    translations=None,
+    force_regenerate_advice=False,
+    use_external_llm_advice=False,
+    report_lens=None,
+):
     if not items:
         return "<html><body><h1>无数据</h1></body></html>"
 
     if translations is None:
         translations = {}
+    lens = report_lens or DEFAULT_REPORT_LENS
 
     n = len(items)
     has_jsonl = any(str(it.get("facet", {}).get("_source", "")).startswith("jsonl") for it in items)
@@ -2375,7 +2355,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
         force_regenerate=force_regenerate_advice,
         use_external_llm=use_external_llm_advice,
     )
-    insights_sections = build_insights_like_sections(session_records, stats_dict)
+    insights_sections = build_insights_like_sections(session_records, stats_dict, lens)
 
     # ── 自动反常检测 ──
     anomalies = detect_anomalies(items, translations)
@@ -3666,8 +3646,8 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
 
   <!-- 你在做什么 -->
   <div class="section" id="work">
-    <h2>工作方向明细</h2>
-    <p class="section-hint">这里保留原始 goal_categories 的聚合明细，作为上面“工作流叙事”的可追溯证据。</p>
+    <h2>{_escape_html(lens.work_detail_title)}</h2>
+    <p class="section-hint">{_escape_html(lens.work_detail_hint)}</p>
     {goals_html}
   </div>
 
@@ -3760,6 +3740,12 @@ def main():
         print(__doc__)
         return
 
+    try:
+        report_lens = get_report_lens(args.lens)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+
     start_d, end_d = resolve_range(args)
 
     # 优先尝试 JSONL 新数据源，无数据则回退到 facets
@@ -3784,6 +3770,7 @@ def main():
             translations,
             force_regenerate_advice=args.regen_advice,
             use_external_llm_advice=args.llm_advice,
+            report_lens=report_lens,
         )
         path = REPORTS_DIR / f"{report_basename(start_d, end_d)}.html"
         path.write_text(report, encoding="utf-8")

@@ -125,6 +125,14 @@ class ReportRenderingTest(unittest.TestCase):
         self.module_globals["sys"].argv = ["insight-zh.py", "2026-05-29", "2026-05-29"]
         self.assertEqual(rolling_alias_basename(parse_args()), "")
 
+    def test_default_report_lens_is_configurable_boundary(self):
+        lens = self.module_globals["DEFAULT_REPORT_LENS"]
+        get_report_lens = self.module_globals["get_report_lens"]
+
+        self.assertEqual(lens.lens_id, "workflow_behavior")
+        self.assertEqual(get_report_lens("workflow_behavior").themes_title, "主要工作流")
+        self.assertTrue(lens.theme_rules)
+
 
 if __name__ == "__main__":
     unittest.main()

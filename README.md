@@ -31,11 +31,29 @@
 ├── insight-zh.py              # 稳定入口
 ├── insight_zh/
 │   ├── insight_cli.py         # HTML/Markdown 报告主逻辑
-│   ├── analysis/              # 启发式与绘画方法论分析
+│   ├── analysis/              # 启发式、语义分析、报告镜头
 │   ├── domain/                # 统一 session 模型
 │   └── sources/               # JSONL / 官方 facets / 中文缓存
 └── tests/
 ```
+
+## 报告镜头
+
+报告方向集中定义在：
+
+```text
+insight_zh/analysis/report_lens.py
+```
+
+默认镜头是 `workflow_behavior`，负责定义：
+
+- 工作流怎么分组
+- 哪些主题优先展示
+- 行为画像怎么表述
+- 重复摩擦怎么解释
+- 可复用规则怎么生成
+
+事实统计和语义字段不在这里改。想调整报告战略方向，优先改 lens，而不是改 JSONL parser 或缓存层。
 
 ## 数据来源
 

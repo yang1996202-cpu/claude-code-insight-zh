@@ -85,4 +85,5 @@ python3 ~/projects/claude-code-insight-zh/insight-zh.py 30 --html --save
 - 缓存带自动计算的 analyzer version；原始 JSONL、官方 usage-data 或分析代码变化后会自动失效重算。
 - 默认报告不需要 `INSIGHT_API_KEY`，也不会调用外部 LLM。
 - 只有显式加 `--llm-advice` 或 `--translate` 时，才会读取 `INSIGHT_API_KEY` 并调用外部模型。
+- 报告方向集中在 `insight_zh/analysis/report_lens.py`；调整战略方向优先改 lens，不要改事实统计层。
 - 回归测试命令：`python3 -m unittest discover -s tests -v`

@@ -45,6 +45,32 @@ flowchart LR
   I --> J["report renderer"]
 ```
 
+## Report Lens
+
+The largest product variable is the report lens, not the raw data source.
+
+The lens is defined in:
+
+- `insight_zh/analysis/report_lens.py`
+
+It controls:
+
+- theme buckets;
+- section titles and hints;
+- topic explanation templates;
+- behavior framing;
+- reusable playbook rules.
+
+It does not control factual counters or parser behavior. This keeps the system
+split into three layers:
+
+1. fact layer: JSONL and git log;
+2. semantic layer: official facets, optional LLM facets, or heuristic fallback;
+3. lens layer: report direction and narrative strategy.
+
+Changing strategic direction should usually mean changing or adding a lens, not
+editing the cache layer or source parser.
+
 ## Source priority
 
 Facts come from JSONL first. Official `/insights` fields are allowed to enrich interpretation, but they do not override the local fact counters that the report depends on.
