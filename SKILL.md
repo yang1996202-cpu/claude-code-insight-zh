@@ -45,7 +45,12 @@ python3 ~/projects/claude-code-insight-zh/insight-zh.py 30 --html --save
 ```text
 ~/.claude/usage-data-zh/reports/YYYY-MM-DD.html
 ~/.claude/usage-data-zh/reports/YYYY-MM-DD_to_YYYY-MM-DD.html
+~/.claude/usage-data-zh/reports/latest-1d.html
+~/.claude/usage-data-zh/reports/latest-7d.html
+~/.claude/usage-data-zh/reports/latest-30d.html
 ```
+
+日期命名文件是历史快照；数字窗口命令会同步更新 `latest-*` 滚动入口。
 
 ### Step 1: 识别模式
 

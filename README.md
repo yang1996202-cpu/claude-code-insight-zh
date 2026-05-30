@@ -16,7 +16,12 @@
 ```text
 ~/.claude/usage-data-zh/reports/YYYY-MM-DD.html
 ~/.claude/usage-data-zh/reports/YYYY-MM-DD_to_YYYY-MM-DD.html
+~/.claude/usage-data-zh/reports/latest-1d.html
+~/.claude/usage-data-zh/reports/latest-7d.html
+~/.claude/usage-data-zh/reports/latest-30d.html
 ```
+
+数字窗口命令会同时更新 `latest-*` 滚动入口。日期命名文件是历史快照，不会自动包含后续新增会话。
 
 ## 当前结构
 

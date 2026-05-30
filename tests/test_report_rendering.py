@@ -81,6 +81,7 @@ class ReportRenderingTest(unittest.TestCase):
         self.assertIn("使用方式画像", html)
         self.assertIn("可复用的协作规则", html)
         self.assertIn("语义来源", html)
+        self.assertIn("历史快照", html)
         self.assertNotIn("Push 率", html)
 
     def test_generate_coaching_advice_defaults_to_local_rules(self):
@@ -113,6 +114,16 @@ class ReportRenderingTest(unittest.TestCase):
 
         self.assertTrue(advice)
         self.assertIn("title", advice[0])
+
+    def test_rolling_alias_basename_for_numeric_windows(self):
+        parse_args = self.module_globals["parse_args"]
+        rolling_alias_basename = self.module_globals["rolling_alias_basename"]
+
+        self.module_globals["sys"].argv = ["insight-zh.py", "7"]
+        self.assertEqual(rolling_alias_basename(parse_args()), "latest-7d")
+
+        self.module_globals["sys"].argv = ["insight-zh.py", "2026-05-29", "2026-05-29"]
+        self.assertEqual(rolling_alias_basename(parse_args()), "")
 
 
 if __name__ == "__main__":

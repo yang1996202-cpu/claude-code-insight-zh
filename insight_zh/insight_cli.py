@@ -210,6 +210,16 @@ def report_basename(start_d, end_d):
     return str(end_d or date.today())
 
 
+def rolling_alias_basename(args):
+    if args.all:
+        return "latest-all"
+    if args.arg1 and re.fullmatch(r"\d+", args.arg1):
+        return f"latest-{int(args.arg1)}d"
+    if args.arg1 is None:
+        return "latest-all"
+    return ""
+
+
 def load_data(start_d, end_d):
     items = []
     if not FACETS_DIR.exists():
@@ -2698,6 +2708,15 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
     </div>
     """
 
+    generated_at = datetime.now().strftime('%Y-%m-%d %H:%M')
+    is_historical_snapshot = last_date < date.today()
+    if is_historical_snapshot:
+        freshness_class = "freshness-banner stale"
+        freshness_text = f"历史快照：这份报告的数据截止到 {last_date}，不会包含之后新增的会话。要看最新滚动窗口，请重新运行数字窗口命令，例如 `insight-zh.py 1 --html --save` 或 `insight-zh.py 7 --html --save`，并打开 latest-1d/latest-7d 报告。"
+    else:
+        freshness_class = "freshness-banner"
+        freshness_text = f"当前滚动窗口：这是一份静态报告，生成于 {generated_at}。新增会话后需要重新运行命令；数字窗口命令会同步更新 latest-1d/latest-7d 入口。"
+
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -2731,6 +2750,21 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
 
   h1 {{ font-size: 2rem; font-weight: 700; margin-bottom: 6px; color: #0f172a; }}
   .subtitle {{ color: var(--text-dim); font-size: 0.95rem; margin-bottom: 32px; }}
+  .freshness-banner {{
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    color: #1e40af;
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin: -16px 0 28px;
+    font-size: 0.9rem;
+    line-height: 1.55;
+  }}
+  .freshness-banner.stale {{
+    background: #fffbeb;
+    border-color: #fde68a;
+    color: #92400e;
+  }}
 
   /* 导航 */
   .nav {{
@@ -3587,6 +3621,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
 <div class="container">
   <h1>Claude Code 洞察报告</h1>
   <div class="subtitle">{n} 个会话 · {first_date} 至 {last_date} · {total_user_msgs:,} 条消息 · {total_dur//60} 小时 · {total_commits}  个 commit</div>
+  <div class="{freshness_class}">{freshness_text}</div>
 
   <div class="nav">
     <a href="#overview">概览</a>
@@ -3710,7 +3745,7 @@ def generate_html_report(items, translations=None, force_regenerate_advice=False
   {summary_html}
 
   <div class="footer">
-    生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')} · 数据来源：{data_source_html}
+    生成时间：{generated_at} · 数据来源：{data_source_html}
   </div>
 </div>
 </body>
@@ -3752,9 +3787,16 @@ def main():
         )
         path = REPORTS_DIR / f"{report_basename(start_d, end_d)}.html"
         path.write_text(report, encoding="utf-8")
+        alias_name = rolling_alias_basename(args)
+        alias_path = None
+        if alias_name:
+            alias_path = REPORTS_DIR / f"{alias_name}.html"
+            alias_path.write_text(report, encoding="utf-8")
         print(f"HTML 报告已保存：{path}")
+        if alias_path:
+            print(f"滚动入口已更新：{alias_path}")
         try:
-            subprocess.run(["open", str(path)], check=False)
+            subprocess.run(["open", str(alias_path or path)], check=False)
         except Exception:
             pass
         return
